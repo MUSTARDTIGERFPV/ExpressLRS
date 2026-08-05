@@ -29,6 +29,9 @@ public:
 private:
     void processBytes(uint8_t *bytes, u_int16_t size) override;
 
+    // Queues an AUTOPILOT_VERSION message towards the GCS describing this ELRS link
+    void sendMavlinkAutopilotVersion();
+
     uint8_t this_system_id;
     const uint8_t this_component_id;
 
@@ -36,6 +39,7 @@ private:
     const uint8_t target_component_id;
 
     uint32_t lastSentFlowCtrl = 0;
+    uint32_t lastSentAutopilotVersion = 0;
 
     // Variables / constants for Mavlink //
     FIFO<MAV_INPUT_BUF_LEN> mavlinkInputBuffer;

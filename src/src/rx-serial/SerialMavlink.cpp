@@ -5,8 +5,12 @@
 #include "common.h"
 #include "config.h"
 #include "device.h"
+#include "options.h"
 
 #define MAVLINK_RC_PACKET_INTERVAL 10
+
+// Interval between periodic AUTOPILOT_VERSION broadcasts towards the GCS
+#define MAVLINK_AUTOPILOT_VERSION_INTERVAL 10000
 
 #define MAVLINK_COMM_NUM_BUFFERS 1
 #include "common/mavlink.h"
@@ -107,6 +111,14 @@ void SerialMavlink::sendQueuedData(uint32_t maxBytesToSend)
         _outputPort->write(buf, len);
     }
 
+    // Periodically advertise the link's AUTOPILOT_VERSION to the GCS. A GCS can
+    // also fetch it on demand via MAV_CMD_REQUEST_MESSAGE (handled below), but the
+    // periodic send guarantees delivery even if that request is never made or is lost.
+    if ((now - lastSentAutopilotVersion) > MAVLINK_AUTOPILOT_VERSION_INTERVAL)
+    {
+        sendMavlinkAutopilotVersion();
+    }
+
     auto size = mavlinkOutputBuffer.size();
     if (size == 0)
     {
@@ -131,12 +143,65 @@ void SerialMavlink::sendQueuedData(uint32_t maxBytesToSend)
         {
             // Message decoded successfully
 
+            // Answer a GCS request for our AUTOPILOT_VERSION. The message is still
+            // forwarded to the flight controller below so it can answer for itself too.
+            if (msg.msgid == MAVLINK_MSG_ID_COMMAND_LONG)
+            {
+                mavlink_command_long_t cmd;
+                mavlink_msg_command_long_decode(&msg, &cmd);
+                // Only answer a request that targets our own system id. A request for
+                // the vehicle goes to the flight controller, which answers for itself.
+                const bool addressedToUs =
+                    cmd.target_system == this_system_id &&
+                    (cmd.target_component == 0 || cmd.target_component == this_component_id);
+                if (addressedToUs)
+                {
+                    switch (cmd.command)
+                    {
+                    case MAV_CMD_REQUEST_MESSAGE:
+                        if ((uint32_t)cmd.param1 == MAVLINK_MSG_ID_AUTOPILOT_VERSION)
+                        {
+                            sendMavlinkAutopilotVersion();
+                        }
+                        break;
+                    case MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES: // deprecated, but still used by some GCSs
+                        sendMavlinkAutopilotVersion();
+                        break;
+                    }
+                }
+            }
+
             // Forward message to the UART
             uint8_t buf[MAVLINK_MAX_PACKET_LEN];
             uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
             _outputPort->write(buf, len);
         }
     }
+}
+
+void SerialMavlink::sendMavlinkAutopilotVersion()
+{
+    mavlink_autopilot_version_t autopilot_version = {};
+    // Advertise MAVLink 2 support so the GCS can negotiate the v2 protocol with the link
+    autopilot_version.capabilities = MAV_PROTOCOL_CAPABILITY_MAVLINK2;
+    // Report the ELRS firmware git hash as the custom version string (not necessarily null-terminated)
+    strncpy((char *)autopilot_version.flight_custom_version, commit, sizeof(autopilot_version.flight_custom_version));
+    // Use the ELRS bind phrase UID as the unique device id (6 bytes packed into the uint64)
+    for (uint8_t i = 0; i < UID_LEN; i++)
+    {
+        autopilot_version.uid = (autopilot_version.uid << 8) | UID[i];
+    }
+
+    mavlink_message_t msg;
+    mavlink_msg_autopilot_version_encode(this_system_id, this_component_id, &msg, &autopilot_version);
+
+    uint8_t buf[MAVLINK_MSG_ID_AUTOPILOT_VERSION_LEN + MAVLINK_NUM_NON_PAYLOAD_BYTES];
+    uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
+    // Queue towards the GCS (downlink), the same path used for vehicle telemetry
+    mavlinkInputBuffer.atomicPushBytes(buf, len);
+
+    // Reset the periodic timer so an on-request send also defers the next broadcast
+    lastSentAutopilotVersion = millis();
 }
 
 void SerialMavlink::event()
