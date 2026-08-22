@@ -112,9 +112,27 @@ MSPframeType_e MSP2CROSSFIRE::getVersion(const uint8_t *data)
 
 void MSP2CROSSFIRE::parse(CRSFConnector *connector, const uint8_t *data, uint32_t frameLen, const crsf_addr_e src, const crsf_addr_e dest)
 {
+    // Need at least $, dir and one length byte to safely inspect the header
+    if (frameLen < 4)
+        return;
+
     const MSPframeType_e mspVersion = getVersion(data);
+    if (mspVersion == MSP_FRAME_UNKNOWN)
+        return;
+
+    // Ensure the length fields we are about to read are within the received buffer
+    const uint32_t headerLen = (mspVersion == MSP_FRAME_V2) ? 8 : (mspVersion == MSP_FRAME_V1_JUMBO) ? 7 : 4;
+    if (frameLen < headerLen)
+        return;
+
     const uint32_t mspPayloadLen = getPayloadLen(data, mspVersion);
     const uint32_t MSPframeLen = getFrameLen(mspPayloadLen, mspVersion);
+
+    // MSPframeLen is derived from a length field inside `data`; the source reads below run
+    // from data[3] up to ~data[3+MSPframeLen], so the declared frame (payload + $X< header +
+    // crc) must actually fit the received buffer or we would read past it
+    if (MSPframeLen + 4 > frameLen)
+        return;
     const uint8_t numChunks = (MSPframeLen / CRSF_MSP_MAX_BYTES_PER_CHUNK) + 1; // count the first chunk!
     const uint8_t chunkRemainder = MSPframeLen % CRSF_MSP_MAX_BYTES_PER_CHUNK;
 

@@ -36,6 +36,14 @@ void CROSSFIRE2MSP::parse(const uint8_t *data, const std::function<void(uint8_t 
         outBuffer[1] = (MSPvers == MSP_FRAME_V1 || MSPvers == MSP_FRAME_V1_JUMBO) ? 'M' : 'X';
         outBuffer[2] = getHeaderDir(data);
         pktLen = getFrameLen(data, MSPvers);
+
+        // pktLen is derived from a wire-supplied payload length (up to 16 bits). The reassembled
+        // frame is header(3) + pktLen + checksum(1); reject anything that won't fit outBuffer.
+        if (pktLen + 4 > sizeof(outBuffer))
+        {
+            reset();
+            return;
+        }
     }
 
     // process the chunk of MSP frame
@@ -43,7 +51,13 @@ void CROSSFIRE2MSP::parse(const uint8_t *data, const std::function<void(uint8_t 
     // but if this isn't the last chunk we can't use the MSP payload length
     // the solution is to use the minimum of the two lengths
     const uint32_t frameLen = pktLen - (idx - 3);
-    const uint32_t minLen = frameLen < CRSFpayloadLen ? frameLen : CRSFpayloadLen;
+    uint32_t minLen = frameLen < CRSFpayloadLen ? frameLen : CRSFpayloadLen;
+    // Never write past outBuffer, reserving one byte for the trailing checksum
+    if (idx + minLen > sizeof(outBuffer) - 1)
+    {
+        reset();
+        return;
+    }
     memcpy(&outBuffer[idx], &data[CRSF_MSP_FRAME_OFFSET], minLen); // chunk of MSP data
     idx += minLen;
 

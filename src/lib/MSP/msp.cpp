@@ -86,6 +86,13 @@ MSP::processReceivedByte(uint8_t c)
                 m_packet.flags = header->flags;
                 // reset the offset iterator for re-use in payload below
                 m_offset = 0;
+                // payloadSize is a 16-bit field straight off the wire; reject anything that
+                // would overflow the fixed payload buffer during MSP_PAYLOAD_V2_NATIVE
+                if (m_packet.payloadSize > sizeof(m_packet.payload)) {
+                    DBGLN("MSP payload too large: %u", m_packet.payloadSize);
+                    m_inputState = MSP_IDLE;
+                    break;
+                }
 				if (m_packet.payloadSize == 0)
                 	m_inputState = MSP_CHECKSUM_V2_NATIVE;
 				else
