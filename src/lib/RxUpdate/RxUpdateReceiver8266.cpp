@@ -285,6 +285,7 @@ static void handle(const Packet &p)
         a.maxImage = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
         a.flags = FLAG_WANTS_GZIP;
         a.proto = PROTO_VERSION;
+        a.domain = buildDomain();
         send(&a, sizeof(a));
         break;
     }

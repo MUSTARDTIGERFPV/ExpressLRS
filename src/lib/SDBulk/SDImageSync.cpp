@@ -8,7 +8,6 @@
 
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
-#include <Preferences.h>
 #include <WiFi.h>
 #include <mbedtls/sha256.h>
 
@@ -16,6 +15,8 @@
 static constexpr uint32_t KEEPALIVE_MS = 800;
 static constexpr uint32_t WIFI_JOIN_TIMEOUT_MS = 20000;
 static constexpr uint32_t HTTP_STALL_TIMEOUT_MS = 10000;
+// where CI publishes card-ready RX images, per build: %s is the build's short sha
+#define RX_SD_MANIFEST_URL "http://artifactory.expresslrs.org/ExpressLRS-rx-sd/%s/manifest.json"
 
 static uint32_t lastCall;
 
@@ -27,9 +28,13 @@ static int keepalive(SDBulkLink &link, const char *text, uint32_t done = 0, uint
     return link.progress(done, total, text);
 }
 
-static bool safeName(const char *s)
+// A key or version as it lands in a card path. The radio takes paths up to 64
+// characters: FIRMWARE/<key>/<version>.bin.gz.part, with keys up to 18
+// ("esp32s3-lr1121-lbt"), leaves 24 for the version.
+static constexpr size_t MAX_KEY = 18, MAX_VERSION = 24;
+static bool safeName(const char *s, size_t maxLen)
 {
-    if (!*s || strlen(s) > 24)
+    if (!*s || strlen(s) > maxLen)
         return false;
     for (; *s; s++)
         if (!isalnum((unsigned char)*s) && *s != '.' && *s != '_' && *s != '-')
@@ -118,7 +123,7 @@ static uint8_t chunk[SDBulk::MAX_PAYLOAD];
 static FetchResult fetchImage(SDBulkLink &link, const String &url, const char *key, const char *version,
                               uint32_t size, const char *sha256hex, uint32_t &bytesFetched)
 {
-    char dir[40], path[72], part[80];
+    char dir[48], path[96], part[104];
     snprintf(dir, sizeof(dir), "FIRMWARE/%s", key);
     snprintf(path, sizeof(path), "%s/%s.bin.gz", dir, version);
     snprintf(part, sizeof(part), "%s.part", path);
@@ -225,14 +230,7 @@ static FetchResult fetchImage(SDBulkLink &link, const String &url, const char *k
 
 void imageSyncNetwork(char *ssid, size_t len)
 {
-    Preferences prefs;
-    String last;
-    if (prefs.begin("sdsync", true))
-    {
-        last = prefs.getString("ssid", "");
-        prefs.end();
-    }
-    snprintf(ssid, len, "%s", last.isEmpty() ? firmwareOptions.home_wifi_ssid : last.c_str());
+    snprintf(ssid, len, "%s", firmwareOptions.home_wifi_ssid);
 }
 
 bool runImageSync(SDBulkLink &link, const char *manifestUrl, char *result, size_t resultLen)
@@ -245,68 +243,66 @@ bool runImageSync(SDBulkLink &link, const char *manifestUrl, char *result, size_
         return false;
     }
 
-    // credentials: WIFI.TXT on the card wins over the flashed home network
-    static char wifiTxt[256];
-    String ssid = firmwareOptions.home_wifi_ssid;
-    String password = firmwareOptions.home_wifi_password;
-    String url = manifestUrl ? manifestUrl : "";
-    if (readSmallFile(link, "WIFI.TXT", wifiTxt, sizeof(wifiTxt)))
+    if (!firmwareOptions.home_wifi_ssid[0])
     {
-        char *save = nullptr;
-        const char *l1 = strtok_r(wifiTxt, "\r\n", &save);
-        const char *l2 = strtok_r(nullptr, "\r\n", &save);
-        const char *l3 = strtok_r(nullptr, "\r\n", &save);
-        if (l1 && l2)
-        {
-            ssid = l1;
-            password = l2;
-        }
-        if (l3 && url.isEmpty())
-            url = l3;
-    }
-    // No URL from the request or the card: use the last one that synced fine. Until
-    // releases publish a manifest at a fixed address, that's the menu's default.
-    Preferences prefs;
-    prefs.begin("sdsync", false);
-    if (url.isEmpty())
-        url = prefs.getString("url", "");
-    if (ssid.isEmpty() || url.isEmpty())
-    {
-        snprintf(result, resultLen, ssid.isEmpty() ? "no WiFi network set" : "no manifest URL set");
+        snprintf(result, resultLen, "No home WiFi set on the TX module");
         link.end(1, result);
         return false;
     }
 
-    if (!joinWifi(link, ssid.c_str(), password.c_str()))
+    // The images CI published for this build, unless a developer points elsewhere:
+    // a URL in the request, or the first line of WIFI.TXT on the card
+    String url = manifestUrl ? manifestUrl : "";
+    static char wifiTxt[256];
+    if (url.isEmpty() && readSmallFile(link, "WIFI.TXT", wifiTxt, sizeof(wifiTxt)))
+    {
+        char *save = nullptr;
+        const char *l1 = strtok_r(wifiTxt, " \t\r\n", &save);
+        if (l1 && strncmp(l1, "http", 4) == 0)
+            url = l1;
+    }
+    const bool ownBuild = url.isEmpty();
+    if (ownBuild)
+    {
+        char buf[96];
+        snprintf(buf, sizeof(buf), RX_SD_MANIFEST_URL, commit);
+        url = buf;
+    }
+
+    if (!joinWifi(link, firmwareOptions.home_wifi_ssid, firmwareOptions.home_wifi_password))
     {
         stopWifi();
-        snprintf(result, resultLen, "could not join %.24s", ssid.c_str());
+        snprintf(result, resultLen, "could not join %.24s", firmwareOptions.home_wifi_ssid);
         link.end(1, result);
         return false;
     }
-    // for the menu label; only written when it changes
-    if (prefs.getString("ssid", "") != ssid)
-        prefs.putString("ssid", ssid);
 
     // the manifest is small; take it whole
     keepalive(link, "Fetching manifest", 0, 0, true);
     String manifest;
+    int code;
     {
         HTTPClient http;
         WiFiClient client;
         http.setTimeout(HTTP_STALL_TIMEOUT_MS);
         http.begin(client, url);
-        const int code = http.GET();
+        code = http.GET();
         if (code == HTTP_CODE_OK)
             manifest = http.getString();
         http.end();
-        if (code != HTTP_CODE_OK)
-        {
-            stopWifi();
+    }
+    // Only now, with the client gone: its destructor closes the socket, and doing that
+    // after WiFi is stopped frees an lwIP buffer into the dead driver (LoadProhibited)
+    if (code != HTTP_CODE_OK)
+    {
+        stopWifi();
+        // a local or unreleased build: nothing was ever published for it
+        if (ownBuild && code == HTTP_CODE_NOT_FOUND)
+            snprintf(result, resultLen, "No RX images published for this TX build");
+        else
             snprintf(result, resultLen, "manifest GET %d", code);
-            link.end(1, result);
-            return false;
-        }
+        link.end(1, result);
+        return false;
     }
     lastCall = 0;
     keepalive(link, "Reading manifest");
@@ -332,7 +328,7 @@ bool runImageSync(SDBulkLink &link, const char *manifestUrl, char *result, size_
         const char *file = kv.value()["file"] | "";
         const char *sha = kv.value()["sha256"] | "";
         const uint32_t size = kv.value()["size"] | 0;
-        if (!safeName(key) || !safeName(version) || !*file || strlen(sha) != 64 || !size)
+        if (!safeName(key, MAX_KEY) || !safeName(version, MAX_VERSION) || !*file || strlen(sha) != 64 || !size)
         {
             failed++;
             continue;
@@ -359,9 +355,6 @@ bool runImageSync(SDBulkLink &link, const char *manifestUrl, char *result, size_
         writeFileAtomically(link, "FIRMWARE/manifest.json", (const uint8_t *)manifest.c_str(), manifest.length());
     }
 
-    if (!cancelled && !failed)
-        prefs.putString("url", url);
-    prefs.end();
 
     if (cancelled)
         snprintf(result, resultLen, "Cancelled");

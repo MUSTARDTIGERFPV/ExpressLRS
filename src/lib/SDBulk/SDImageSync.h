@@ -12,14 +12,14 @@
 //     "images": { "esp32-2400": { "version": "4.1.0", "file": "esp32-2400/4.1.0.bin.gz",
 //                                 "size": 712345, "sha256": "<64 hex>" }, ... } }
 //
-// Credentials and the manifest URL come from, in order: the session request,
-// /ELRS/WIFI.TXT (ssid, password, manifest URL, one per line), the firmware options.
+// It joins the home network from the firmware options and, by default, fetches the
+// manifest CI published for this very build (RX_SD_MANIFEST_URL), so the receivers
+// always get images that match the TX. For development, a manifest URL from the
+// session request or the first line of /ELRS/WIFI.TXT replaces that default.
 
 bool runImageSync(SDBulkLink &link, const char *manifestUrl, char *result, size_t resultLen);
 
-// The network a sync will most likely join, for the menu: the last one joined (it may
-// have come from WIFI.TXT, which can't be read outside a session), else the home
-// network from the firmware options. Empty if there's neither.
+// The network a sync will join, for the menu; empty if none is set
 void imageSyncNetwork(char *ssid, size_t len);
 
 #endif

@@ -111,7 +111,21 @@ struct __attribute__((packed)) HelloAck
     uint32_t maxImage;
     uint8_t flags;     // FLAG_*; absent (0) from older receivers
     uint8_t proto;     // PROTO_VERSION; absent (0) from older receivers
+    uint8_t domain;    // DOMAIN_*: which regulatory build this is; absent (0) means FCC
 };
+
+// HelloAck.domain. The 2.4 GHz regulatory domain is compiled in, not set in the
+// trailer, so an EU receiver must only ever get the LBT image: "<key>-lbt" on the card.
+constexpr uint8_t DOMAIN_FCC = 0;
+constexpr uint8_t DOMAIN_LBT = 1;
+inline uint8_t buildDomain()
+{
+#if defined(Regulatory_Domain_EU_CE_2400)
+    return DOMAIN_LBT;
+#else
+    return DOMAIN_FCC;
+#endif
+}
 
 struct __attribute__((packed)) Begin
 {

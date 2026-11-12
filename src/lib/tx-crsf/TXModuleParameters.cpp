@@ -602,11 +602,7 @@ void TXModuleEndpoint::handleSdSession(propertiesCommon *item, uint8_t arg)
       if (SDSession::busy() || millis() - SDSession::finishedAt() < RESULT_SHOW_MS)
         sendCommandResponse(cmd, lcsExecuting, SDSession::statusText());
       else
-      {
-        // a sync may have joined a different network (WIFI.TXT)
-        updateSyncLabel();
         sendCommandResponse(cmd, lcsIdle, STR_EMPTYSPACE);
-      }
       break;
   }
 }

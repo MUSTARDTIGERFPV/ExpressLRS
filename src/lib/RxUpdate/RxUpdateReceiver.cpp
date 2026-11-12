@@ -286,6 +286,7 @@ static void handle(const Packet &p)
         const esp_partition_t *next = esp_ota_get_next_update_partition(nullptr);
         a.maxImage = next ? next->size - TRAILER_SIZE : 0;
         a.proto = PROTO_VERSION;
+        a.domain = buildDomain();
         send(&a, sizeof(a));
         break;
     }

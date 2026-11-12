@@ -7,6 +7,7 @@
 #include "RxUpdateProto.h"
 #include "logging.h"
 
+#include <ArduinoJson.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
@@ -150,13 +151,49 @@ static void cancelRx(CancelReason reason, const char *text)
     exchange(&c, sizeof(c), CANCEL_UPDATE_ACK, r, 200, 3);
 }
 
-// newest image for this key: the lexically greatest finished file in the directory
+// The image the last sync left for this key, as FIRMWARE/manifest.json records it
+// (version names from CI don't sort by age); false if there's no such record
+static bool syncedImage(SDBulkLink &link, const char *key, bool gzOnly, char *path, size_t pathLen)
+{
+    static char manifest[4096];
+    uint8_t h;
+    uint32_t size;
+    if (link.open("FIRMWARE/manifest.json", SDBulk::OPEN_READ, &h, &size) != SDBulk::OK)
+        return false;
+    uint32_t off = 0;
+    while (off < size && off < sizeof(manifest) - 1)
+    {
+        uint16_t got = 0;
+        const uint16_t want = std::min<uint32_t>(link.chunkSize(), sizeof(manifest) - 1 - off);
+        if (link.read(h, off, (uint8_t *)manifest + off, want, &got) != SDBulk::OK || !got)
+            break;
+        off += got;
+    }
+    link.close(h);
+    manifest[off] = '\0';
+
+    JsonDocument doc;
+    if (deserializeJson(doc, manifest) != DeserializationError::Ok)
+        return false;
+    const char *version = doc["images"][key]["version"] | "";
+    if (!*version)
+        return false;
+    // the sync stores every image as .bin.gz
+    snprintf(path, pathLen, "FIRMWARE/%s/%s.bin.gz", key, version);
+    uint32_t have = 0;
+    bool isDir = false;
+    return link.stat(path, &have, &isDir) == SDBulk::OK && !isDir && have > 0;
+}
+
+// Images copied by hand, with no sync record: the lexically greatest finished file
 static bool pickImage(SDBulkLink &link, const char *key, bool gzOnly, char *path, size_t pathLen)
 {
+    if (syncedImage(link, key, gzOnly, path, pathLen))
+        return true;
     char dir[40];
     snprintf(dir, sizeof(dir), "FIRMWARE/%s", key);
     static uint8_t resp[SDBulk::MAX_PAYLOAD];
-    char best[48] = "";
+    char best[56] = "";
     uint16_t cookie = 0;
     while (cookie != 0xFFFF)
     {
@@ -350,18 +387,21 @@ bool runRxUpdate(SDBulkLink &link, const char *path, bool linked, char *result, 
         return linked ? failRx(CANCEL_OTHER, "Receiver not found") : fail("Receiver not found at power-on");
     }
     info.key[sizeof(info.key) - 1] = info.version[sizeof(info.version) - 1] = '\0';
+    // where its images live on the card: EU (LBT) builds have their own
+    char key[24];
+    snprintf(key, sizeof(key), "%s%s", info.key, info.domain == DOMAIN_LBT ? "-lbt" : "");
     char rxCommit[9] = {};
     memcpy(rxCommit, info.commit, 8);
     DBGLN("RX update: found %s %s (%s), max %u", info.key, info.version, rxCommit, info.maxImage);
 
     const bool wantsGzip = info.flags & FLAG_WANTS_GZIP;
-    char imagePath[80];
+    char imagePath[96];
     if (path && *path)
         snprintf(imagePath, sizeof(imagePath), "%s", path);
-    else if (!pickImage(link, info.key, wantsGzip, imagePath, sizeof(imagePath)))
+    else if (!pickImage(link, key, wantsGzip, imagePath, sizeof(imagePath)))
     {
         char msg[48];
-        snprintf(msg, sizeof(msg), "No %.16s image on SD - sync first", info.key);
+        snprintf(msg, sizeof(msg), "No %.18s image on SD - sync first", key);
         return failRx(CANCEL_NO_IMAGE, msg);
     }
 
