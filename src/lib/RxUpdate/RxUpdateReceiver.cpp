@@ -282,7 +282,7 @@ void RxUpdateReceiver::loop(uint32_t now)
         packets++;
         handle(p);
     }
-    if ((int32_t)(now - lastReport) >= 1000)
+    if ((int32_t)(now - lastReport) >= 2000)
     {
         lastReport = now;
         RXU_LOG("alive: %u packets, expected %u/%u\n", packets, expected, imageSize);
