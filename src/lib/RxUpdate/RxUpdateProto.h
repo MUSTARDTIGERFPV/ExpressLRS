@@ -2,7 +2,9 @@
 
 #include <stdint.h>
 #include <string.h>
+#if defined(PLATFORM_ESP32)
 #include <esp_wifi_types.h>
+#endif
 
 // TX -> RX firmware transfer over ESP-NOW, after the RX was told over the RC link
 // (MSP_ELRS_ENTER_RX_UPDATE) to stop the radio and listen.
@@ -27,8 +29,16 @@ constexpr uint16_t DATA_MAX = 232;
 // packets the TX keeps in flight; the RX acks cumulatively ("next offset I expect")
 // and only ever writes in order, so a gap means go-back-N from the oldest unacked
 constexpr uint8_t WINDOW = 8;
+#if defined(PLATFORM_ESP32)
 // the default 1 Mbps caps a 232 B packet stream at ~80 KB/s before acks
 constexpr wifi_phy_rate_t ESPNOW_RATE = WIFI_PHY_RATE_12M;
+#endif
+
+// HelloAck.flags
+// The RX wants the file's bytes as they are on the card (.bin.gz), not inflated: the
+// ESP8285 has no second app slot, the raw image doesn't fit next to the running one,
+// and its bootloader inflates gzip images itself.
+constexpr uint8_t FLAG_WANTS_GZIP = 0x01;
 
 enum Type : uint8_t
 {
@@ -67,6 +77,7 @@ struct __attribute__((packed)) HelloAck
     char version[24];
     char commit[8];
     uint32_t maxImage;
+    uint8_t flags;     // FLAG_*; absent (0) from older receivers
 };
 
 struct __attribute__((packed)) Begin

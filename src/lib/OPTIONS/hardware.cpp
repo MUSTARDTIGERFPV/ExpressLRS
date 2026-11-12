@@ -269,9 +269,19 @@ bool hardware_init(EspFlashStream &strmFlash)
 
     Stream *strmSrc;
     JsonDocument doc;
+    constexpr size_t hardwareConfigOffset = ELRSOPTS_PRODUCTNAME_SIZE + ELRSOPTS_DEVICENAME_SIZE + ELRSOPTS_OPTIONS_SIZE;
     File file = LittleFS.open("/hardware.json", "r");
+    if (file && !file.isDirectory())
+    {
+        // A copy carried across an over-the-air update ("_carried") only stands in for
+        // a missing trailer; a layout flashed in a trailer later wins over it
+        strmFlash.setPosition(hardwareConfigOffset);
+        if (file.find("\"_carried\"") && options_HasStringInFlash(strmFlash))
+            file.close();
+        else
+            file.seek(0);
+    }
     if (!file || file.isDirectory()) {
-        constexpr size_t hardwareConfigOffset = ELRSOPTS_PRODUCTNAME_SIZE + ELRSOPTS_DEVICENAME_SIZE + ELRSOPTS_OPTIONS_SIZE;
         strmFlash.setPosition(hardwareConfigOffset);
         if (!options_HasStringInFlash(strmFlash))
         {

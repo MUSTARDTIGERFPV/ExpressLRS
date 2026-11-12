@@ -240,7 +240,20 @@ static bool options_LoadProductAndDeviceName(EspFlashStream &strmFlash)
 
         return true;
     }
-    else
+    #if defined(TARGET_RX)
+    // An RX updated over the air without a trailer (ESP8285) left its names here
+    File file = LittleFS.open("/product.json", "r");
+    if (file && !file.isDirectory())
+    {
+        JsonDocument doc;
+        if (deserializeJson(doc, file) == DeserializationError::Ok)
+        {
+            strlcpy(product_name, doc["product_name"] | "Unified RX", ELRSOPTS_PRODUCTNAME_SIZE + 1);
+            strlcpy(device_name, doc["lua_name"] | "Unified RX", ELRSOPTS_DEVICENAME_SIZE + 1);
+            return true;
+        }
+    }
+    #endif
     {
         #if defined(TARGET_RX)
         strcpy(product_name, "Unified RX");

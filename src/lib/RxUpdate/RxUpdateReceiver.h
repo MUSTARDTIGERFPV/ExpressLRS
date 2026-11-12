@@ -1,6 +1,6 @@
 #pragma once
 
-#if defined(TARGET_RX) && defined(PLATFORM_ESP32)
+#if defined(TARGET_RX) && (defined(PLATFORM_ESP32) || defined(PLATFORM_ESP8266))
 
 #include <stdint.h>
 

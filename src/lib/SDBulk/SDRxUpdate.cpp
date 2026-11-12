@@ -136,7 +136,7 @@ static void stopEspNow()
 }
 
 // newest image for this key: the lexically greatest finished file in the directory
-static bool pickImage(SDBulkLink &link, const char *key, char *path, size_t pathLen)
+static bool pickImage(SDBulkLink &link, const char *key, bool gzOnly, char *path, size_t pathLen)
 {
     char dir[40];
     snprintf(dir, sizeof(dir), "FIRMWARE/%s", key);
@@ -162,7 +162,7 @@ static bool pickImage(SDBulkLink &link, const char *key, char *path, size_t path
             name[std::min<uint8_t>(nl, 64)] = '\0';
             i += 6 + nl;
             const size_t len = strlen(name);
-            const bool image = (len > 4 && strcmp(name + len - 4, ".bin") == 0) ||
+            const bool image = (!gzOnly && len > 4 && strcmp(name + len - 4, ".bin") == 0) ||
                                (len > 7 && strcmp(name + len - 7, ".bin.gz") == 0);
             if (!isDir && image && strlen(name) < sizeof(best) && strcmp(name, best) > 0)
                 strcpy(best, name);
@@ -178,11 +178,12 @@ static bool pickImage(SDBulkLink &link, const char *key, char *path, size_t path
 class ImageSource
 {
 public:
-    bool open(SDBulkLink &l, const char *path, uint32_t &rawSize)
+    // passthrough: hand out the file's bytes as they are, even if it's gzip
+    bool open(SDBulkLink &l, const char *path, uint32_t &rawSize, bool passthrough)
     {
         link = &l;
         const size_t pl = strlen(path);
-        gz = pl > 3 && strcmp(path + pl - 3, ".gz") == 0;
+        gz = !passthrough && pl > 3 && strcmp(path + pl - 3, ".gz") == 0;
         if (link->open(path, SDBulk::OPEN_READ, &h, &fileSize) != SDBulk::OK)
             return false;
         fileOff = inPos = inLen = 0;
@@ -330,10 +331,11 @@ bool runRxUpdate(SDBulkLink &link, const char *path, char *result, size_t result
     memcpy(rxCommit, info.commit, 8);
     DBGLN("RX update: found %s %s (%s), max %u", info.key, info.version, rxCommit, info.maxImage);
 
+    const bool wantsGzip = info.flags & FLAG_WANTS_GZIP;
     char imagePath[80];
     if (path && *path)
         snprintf(imagePath, sizeof(imagePath), "%s", path);
-    else if (!pickImage(link, info.key, imagePath, sizeof(imagePath)))
+    else if (!pickImage(link, info.key, wantsGzip, imagePath, sizeof(imagePath)))
     {
         snprintf(result, resultLen, "no image for %.16s", info.key);
         stopEspNow();
@@ -343,8 +345,12 @@ bool runRxUpdate(SDBulkLink &link, const char *path, char *result, size_t result
 
     if (!src)
         src = new ImageSource();
+    const size_t ipl = strlen(imagePath);
+    if (wantsGzip && !(ipl > 3 && strcmp(imagePath + ipl - 3, ".gz") == 0))
+        return fail("RX needs a .bin.gz image");
+    // "rawSize" is what goes over the air: the inflated image, or the .gz itself
     uint32_t rawSize = 0;
-    if (!src->open(link, imagePath, rawSize))
+    if (!src->open(link, imagePath, rawSize, wantsGzip))
         return fail("Can't open image");
     if (rawSize > info.maxImage)
     {

@@ -1252,7 +1252,7 @@ void DataUlReceiveComplete()
             setWifiUpdateMode();
         });
         break;
-#if defined(PLATFORM_ESP32)
+#if defined(PLATFORM_ESP32) || defined(PLATFORM_ESP8266)
     case MSP_ELRS_ENTER_RX_UPDATE: // 0x12
         // same as wifi: let the ACK go out first
         deferExecutionMillis(500, []() {
@@ -2126,7 +2126,7 @@ void loop()
     CheckConfigChangePending();
     executeDeferredFunction(micros());
 
-#if defined(PLATFORM_ESP32)
+#if defined(PLATFORM_ESP32) || defined(PLATFORM_ESP8266)
     if (connectionState == rxUpdate)
     {
         RxUpdateReceiver::loop(now);

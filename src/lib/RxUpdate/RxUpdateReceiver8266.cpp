@@ -1,0 +1,341 @@
+#if defined(TARGET_RX) && defined(PLATFORM_ESP8266)
+
+// ESP8285 side of the TX -> RX firmware transfer (see RxUpdateProto.h).
+//
+// Differences from the ESP32 receiver:
+//  * There's no second app slot. The updater writes into the free space after the
+//    running sketch and eboot copies it over on reboot, so the image has to fit in
+//    ~430 KB: the RX asks for the .bin.gz as-is (FLAG_WANTS_GZIP) and eboot inflates it.
+//  * Our own options/hardware trailer can't be appended (it would have to be inside the
+//    gzip stream), so it's carried across in LittleFS instead: /options.json,
+//    /hardware.json (marked "_carried") and /product.json, which options.cpp and
+//    hardware.cpp fall back to when the new image boots without a trailer.
+
+#include "RxUpdateReceiver.h"
+#include "RxUpdateProto.h"
+
+#include <Arduino.h>
+#include "targets.h"
+#include "device.h"
+#include "common.h"
+#include "OTA.h"
+#include "hwTimer.h"
+#include "logging.h"
+#include "options.h"
+
+#include <ArduinoJson.h>
+#include <ESP8266WiFi.h>
+#include <LittleFS.h>
+#include <Updater.h>
+#include <bearssl/bearssl_hash.h>
+#include <espnow.h>
+extern "C" {
+#include <user_interface.h>
+}
+
+using namespace RxUpdate;
+
+static constexpr uint32_t IDLE_REBOOT_MS = 30000;
+static constexpr size_t OPTIONS_OFFSET = ELRSOPTS_PRODUCTNAME_SIZE + ELRSOPTS_DEVICENAME_SIZE;
+static constexpr size_t HARDWARE_OFFSET = OPTIONS_OFFSET + ELRSOPTS_OPTIONS_SIZE;
+static constexpr size_t TRAILER_SIZE = HARDWARE_OFFSET + ELRSOPTS_HARDWARE_SIZE;
+
+#if defined(RADIO_SX128X)
+#define KEY_RADIO "2400"
+#else
+#define KEY_RADIO "900"
+#endif
+
+#define RXU_LOG(...) Serial.printf("RXU " __VA_ARGS__)
+
+// The recv callback runs in the SDK's context: copy into a small ring, handle in loop()
+struct Packet
+{
+    uint8_t mac[6];
+    uint8_t len;
+    uint8_t data[250];
+};
+static constexpr uint8_t RING = 12; // > RxUpdate::WINDOW, and RAM is tight on a 8285
+static Packet ring[RING];
+static volatile uint8_t ringHead = 0, ringTail = 0;
+
+static uint8_t peer[6];
+static bool havePeer = false;
+static uint32_t lastPacket = 0, lastReport = 0, packets = 0;
+static uint32_t expected = 0, imageSize = 0;
+static bool started = false;
+static bool finished = false;
+static FinishAck finishResult;
+static br_sha256_context sha;
+static uint32_t rebootAt = 0;
+
+static void onRecv(uint8_t *mac, uint8_t *data, uint8_t len)
+{
+    if (!valid(data, len))
+        return;
+    const uint8_t next = (ringHead + 1) % RING;
+    if (next == ringTail)
+        return; // full: the TX's go-back-N resends it
+    Packet &p = ring[ringHead];
+    memcpy(p.mac, mac, 6);
+    p.len = len;
+    memcpy(p.data, data, len);
+    ringHead = next;
+}
+
+static void send(const void *pkt, size_t len)
+{
+    esp_now_send(peer, (uint8_t *)pkt, len);
+}
+
+static void header(Header &h, Type t, uint8_t seq)
+{
+    h.magic[0] = MAGIC0;
+    h.magic[1] = MAGIC1;
+    h.type = t;
+    h.seq = seq;
+}
+
+bool RxUpdateReceiver::enter()
+{
+    if (CRSF_to_BIT(ChannelData[4]))
+    {
+        DBGLN("RX update refused: armed");
+        return false;
+    }
+    setConnectionState(rxUpdate);
+    hwTimer::stop();
+    Radio.End();
+
+    // Update mode owns UART0 (normally the CRSF output): use it as a plain log
+    Serial.end();
+    Serial.begin(115200);
+
+    uint8_t mac[6];
+    macFromUid(UID, mac);
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    const bool macOk = wifi_set_macaddr(STATION_IF, mac);
+    const bool chOk = wifi_set_channel(ESPNOW_CHANNEL);
+    const int nowErr = esp_now_init();
+    esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
+    esp_now_register_recv_cb(onRecv);
+    RXU_LOG("enter: mac %02x:%02x:%02x:%02x:%02x:%02x (set %d) ch %u (set %d) espnow %d free %u\n", mac[0], mac[1],
+            mac[2], mac[3], mac[4], mac[5], macOk, wifi_get_channel(), chOk, nowErr, ESP.getFreeSketchSpace());
+    lastPacket = millis();
+    return true;
+}
+
+static void addPeer(const uint8_t *mac)
+{
+    if (havePeer && memcmp(peer, mac, 6) == 0)
+        return;
+    if (havePeer)
+        esp_now_del_peer(peer);
+    memcpy(peer, mac, 6);
+    esp_now_add_peer(peer, ESP_NOW_ROLE_COMBO, ESPNOW_CHANNEL, nullptr, 0);
+    havePeer = true;
+}
+
+// One NUL-terminated JSON field of the running image's trailer, or "" if it has none
+static String trailerField(size_t offset, size_t maxLen)
+{
+    static uint32_t buf[ELRSOPTS_HARDWARE_SIZE / 4];
+    if (ESP.flashRead(ESP.getSketchSize() + offset, buf, maxLen) == false)
+        return String();
+    const char *s = (const char *)buf;
+    if (buf[0] == 0xFFFFFFFF)
+        return String();
+    return String(s).substring(0, strnlen(s, maxLen));
+}
+
+// The new image boots without a trailer; leave what it needs in LittleFS
+static bool carryConfig()
+{
+    // product/lua name: from RAM, so it survives any number of OTA generations
+    {
+        JsonDocument doc;
+        doc["product_name"] = (const char *)product_name;
+        doc["lua_name"] = (const char *)device_name;
+        File f = LittleFS.open("/product.json", "w");
+        if (!f || serializeJson(doc, f) == 0)
+            return false;
+    }
+
+    // options: the trailer's if this image has one; otherwise /options.json is already
+    // what we're running on, so it stays
+    const String options = trailerField(OPTIONS_OFFSET, ELRSOPTS_OPTIONS_SIZE);
+    if (options.length())
+    {
+        File f = LittleFS.open("/options.json", "w");
+        if (!f || f.print(options) != options.length())
+            return false;
+    }
+
+    // hardware: carried copies are marked, so a layout flashed later over UART wins
+    const String hardware = trailerField(HARDWARE_OFFSET, ELRSOPTS_HARDWARE_SIZE);
+    if (hardware.length())
+    {
+        JsonDocument doc;
+        if (deserializeJson(doc, hardware) != DeserializationError::Ok)
+            return false;
+        doc["_carried"] = true;
+        File f = LittleFS.open("/hardware.json", "w");
+        if (!f || serializeJson(doc, f) == 0)
+            return false;
+    }
+    return true;
+}
+
+static uint8_t finish(const Finish *f, char *text, size_t textLen)
+{
+    if (!started || expected != imageSize)
+    {
+        snprintf(text, textLen, "short image %u/%u", expected, imageSize);
+        return ST_NOT_STARTED;
+    }
+    uint8_t digest[32];
+    br_sha256_out(&sha, digest);
+    if (memcmp(digest, f->sha256, 32) != 0)
+    {
+        // no end(): on the ESP8266 that would schedule eboot to copy this image
+        started = false;
+        snprintf(text, textLen, "hash mismatch");
+        return ST_BAD_HASH;
+    }
+    if (!carryConfig())
+    {
+        // no end(): on the ESP8266 that would schedule eboot to copy this image
+        started = false;
+        snprintf(text, textLen, "config carry failed");
+        return ST_WRITE_FAILED;
+    }
+    // end() checks the size matches what begin() was given and tells eboot to copy
+    if (!Update.end())
+    {
+        started = false;
+        snprintf(text, textLen, "update failed (%u)", Update.getError());
+        return ST_WRITE_FAILED;
+    }
+    started = false;
+    snprintf(text, textLen, "ok, rebooting");
+    return ST_OK;
+}
+
+static void handle(const Packet &p)
+{
+    const auto h = (const Header *)p.data;
+    addPeer(p.mac);
+
+    switch (h->type)
+    {
+    case HELLO:
+    {
+        HelloAck a = {};
+        header(a.h, HELLO_ACK, h->seq);
+        strncpy(a.key, "esp8285-" KEY_RADIO, sizeof(a.key));
+        strncpy(a.version, version, sizeof(a.version));
+        strncpy(a.commit, commit, sizeof(a.commit));
+        // same margin the web updater uses
+        a.maxImage = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+        a.flags = FLAG_WANTS_GZIP;
+        send(&a, sizeof(a));
+        break;
+    }
+
+    case BEGIN:
+    {
+        const auto b = (const Begin *)p.data;
+        StatusOnly a;
+        header(a.h, BEGIN_ACK, h->seq);
+        if (started)
+        {
+            a.status = imageSize == b->size ? ST_OK : ST_WRITE_FAILED;
+        }
+        else if (!Update.begin(b->size, U_FLASH))
+        {
+            a.status = ST_TOO_BIG;
+        }
+        else
+        {
+            started = true;
+            imageSize = b->size;
+            expected = 0;
+            br_sha256_init(&sha);
+            a.status = ST_OK;
+        }
+        send(&a, sizeof(a));
+        break;
+    }
+
+    case DATA:
+    {
+        const auto d = (const Data *)p.data;
+        const int n = p.len - (int)offsetof(Data, data);
+        DataAck a;
+        header(a.h, DATA_ACK, h->seq);
+        a.status = ST_OK;
+        if (!started)
+        {
+            a.status = ST_NOT_STARTED;
+        }
+        else if (d->offset == expected && n > 0 && expected + n <= imageSize)
+        {
+            // in order only; the ESP8266 updater erases sector by sector as it goes,
+            // and the TX's window rides out those stalls
+            if (Update.write((uint8_t *)d->data, n) != (size_t)n)
+            {
+                a.status = ST_WRITE_FAILED;
+            }
+            else
+            {
+                br_sha256_update(&sha, d->data, n);
+                expected += n;
+            }
+        }
+        a.next = expected;
+        send(&a, sizeof(a));
+        break;
+    }
+
+    case FINISH:
+    {
+        if (!finished)
+        {
+            finishResult = {};
+            finishResult.status = finish((const Finish *)p.data, finishResult.text, sizeof(finishResult.text));
+            finished = finishResult.status == ST_OK;
+            if (finished)
+                rebootAt = millis() + 5000;
+        }
+        header(finishResult.h, FINISH_ACK, h->seq);
+        send(&finishResult, sizeof(finishResult));
+        break;
+    }
+    }
+}
+
+void RxUpdateReceiver::loop(uint32_t now)
+{
+    while (ringTail != ringHead)
+    {
+        lastPacket = now;
+        packets++;
+        handle(ring[ringTail]);
+        ringTail = (ringTail + 1) % RING;
+    }
+    if ((int32_t)(now - lastReport) >= 2000)
+    {
+        lastReport = now;
+        RXU_LOG("alive: %u packets, expected %u/%u\n", packets, expected, imageSize);
+    }
+    if ((rebootAt && (int32_t)(now - rebootAt) > 0) || (int32_t)(now - lastPacket) > (int32_t)IDLE_REBOOT_MS)
+    {
+        // after a good FINISH, end() already told eboot to copy (and inflate) the new
+        // image; otherwise nothing was scheduled and we come back on the old one
+        ESP.restart();
+    }
+}
+
+#endif
