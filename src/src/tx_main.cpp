@@ -38,6 +38,9 @@ void sendMAVLinkTelemetryToBackpack(uint8_t *) {}
 #include "TXModuleEndpoint.h"
 #include "TXOTAConnector.h"
 #include "TXUSBConnector.h"
+#if defined(PLATFORM_ESP32)
+#include "SDSession.h"
+#endif
 
 #if defined(PLATFORM_ESP8266)
 #include <user_interface.h>
@@ -1501,6 +1504,10 @@ void loop()
   executeDeferredFunction(micros());
 
   HandleUARTin();
+
+#if defined(PLATFORM_ESP32)
+  SDSession::loop(now);
+#endif
 
   if (connectionState > MODE_STATES)
   {

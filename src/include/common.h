@@ -48,6 +48,7 @@ typedef enum
     NO_CONFIG_SAVE_STATES,
     wifiUpdate,
     serialUpdate,
+    sdBulk,           // TX only: the handset port is running the SD bulk protocol
     // Failure states go below here to display immediately
     FAILURE_STATES,
     radioFailed,
