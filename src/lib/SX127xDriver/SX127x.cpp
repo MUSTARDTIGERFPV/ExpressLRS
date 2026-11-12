@@ -1,6 +1,9 @@
 #include "SX127x.h"
 #include "logging.h"
 #include "RFAMP_hal.h"
+#if defined(PLATFORM_TANGO2)
+#include "tango2_platform.h"
+#endif
 
 SX127xHal hal;
 SX127xDriver *SX127xDriver::instance = NULL;
@@ -166,7 +169,12 @@ void SX127xDriver::ConfigLoraDefaults()
   hal.writeRegister(SX127X_REG_FIFO_RX_BASE_ADDR, SX127X_FIFO_RX_BASE_ADDR_MAX, SX12XX_Radio_All);
   hal.writeRegisterBits(SX127X_REG_DIO_MAPPING_1, SX127X_DIO0_RXTX_DONE, SX127X_DIO0_MASK, SX12XX_Radio_All); //undocumented "hack", looking at Table 18 from datasheet SX127X_REG_DIO_MAPPING_1 = 11 appears to be unspported by infact it generates an intterupt on both RXdone and TXdone, this saves switching modes.
   hal.writeRegister(SX127X_REG_LNA, SX127X_LNA_BOOST_ON, SX12XX_Radio_All);
+#if defined(RADIO_SX1272)
+  // no ModemConfig3 on the SX1272: AgcAutoOn is ModemConfig2 bit 2, LowDataRateOptimize ModemConfig1 bit 0 (stays off)
+  hal.writeRegisterBits(SX127X_REG_MODEM_CONFIG_2, SX1272_AGC_AUTO_ON, SX1272_AGC_AUTO_MASK, SX12XX_Radio_All);
+#else
   hal.writeRegister(SX1278_REG_MODEM_CONFIG_3, SX1278_AGC_AUTO_ON | SX1278_LOW_DATA_RATE_OPT_OFF, SX12XX_Radio_All);
+#endif
   hal.writeRegisterBits(SX127X_REG_OCP, SX127X_OCP_ON | SX127X_OCP_150MA, SX127X_OCP_MASK, SX12XX_Radio_All); //150ma max current
   SetPreambleLength(SX127X_PREAMBLE_LENGTH_LSB);
 }
@@ -301,6 +309,9 @@ void ICACHE_RAM_ATTR SX127xDriver::CommitOutputPower()
   pwrCurrent = pwrPending & 0xFF;
   pwrPending = PWRPENDING_NONE;
   hal.writeRegister(SX127X_REG_PA_CONFIG, pwrCurrent, SX12XX_Radio_All);
+#if defined(PLATFORM_TANGO2)
+  tango2_pa2_for_power(pwrCurrent);
+#endif
 }
 
 void SX127xDriver::SetPreambleLength(uint8_t PreambleLen)
@@ -424,6 +435,10 @@ void ICACHE_RAM_ATTR SX127xDriver::TXnb(uint8_t * data, bool sendGeminiBuffer, u
 #endif
 
   RFAMP.TXenable(radioNumber);
+#if defined(RADIO_SX1272)
+  // the SX1272 documents no RxDone|TxDone DIO0 mapping (0b11 is an SX1276 quirk): map per mode
+  hal.writeRegister(SX127X_REG_DIO_MAPPING_1, SX127X_DIO0_TX_DONE, radioNumber);
+#endif
   hal.writeRegister(SX127X_REG_FIFO_ADDR_PTR, SX127X_FIFO_TX_BASE_ADDR_MAX, radioNumber);
   if (sendGeminiBuffer)
   {
@@ -451,6 +466,9 @@ bool ICACHE_RAM_ATTR SX127xDriver::RXnbISR(SX12XX_Radio_Number_t radioNumber)
 void ICACHE_RAM_ATTR SX127xDriver::RXnb()
 {
   RFAMP.RXenable();
+#if defined(RADIO_SX1272)
+  hal.writeRegister(SX127X_REG_DIO_MAPPING_1, SX127X_DIO0_RX_DONE, SX12XX_Radio_All);
+#endif
   SetMode(SX127x_OPMODE_RXCONTINUOUS, SX12XX_Radio_All);
 }
 
@@ -564,7 +582,13 @@ void ICACHE_RAM_ATTR SX127xDriver::SetMode(SX127x_RadioOPmodes mode, SX12XX_Radi
   //    return;
   // }
 
+#if defined(RADIO_SX1272)
+  // Keep LongRangeMode set in every write, as Semtech's reference driver does: the datasheet
+  // lets bit 7 change whenever the chip is asleep, so "0x01" from sleep would mean FSK standby.
+  hal.writeRegister(SX127X_REG_OP_MODE, mode | lowFrequencyMode | ModFSKorLoRa, radioNumber);
+#else
   hal.writeRegister(SX127X_REG_OP_MODE, mode | lowFrequencyMode, radioNumber);
+#endif
   currOpmode = mode;
 }
 
@@ -654,14 +678,20 @@ uint8_t ICACHE_RAM_ATTR SX127xDriver::UnsignedGetLastPacketRSSI(SX12XX_Radio_Num
   return hal.readRegister(SX127X_REG_PKT_RSSI_VALUE, radioNumber);
 }
 
+#if defined(RADIO_SX1272)
+#define SX127X_RSSI_OFFSET (-139)
+#else
+#define SX127X_RSSI_OFFSET (lowFrequencyMode ? -164 : -157)
+#endif
+
 int8_t ICACHE_RAM_ATTR SX127xDriver::GetLastPacketRSSI(SX12XX_Radio_Number_t radioNumber)
 {
-  return ((lowFrequencyMode ? -164 : -157) + hal.readRegister(SX127X_REG_PKT_RSSI_VALUE, radioNumber));
+  return (SX127X_RSSI_OFFSET + hal.readRegister(SX127X_REG_PKT_RSSI_VALUE, radioNumber));
 }
 
 int8_t ICACHE_RAM_ATTR SX127xDriver::GetCurrRSSI(SX12XX_Radio_Number_t radioNumber)
 {
-  return ((lowFrequencyMode ? -164 : -157) + hal.readRegister(SX127X_REG_RSSI_VALUE, radioNumber));
+  return (SX127X_RSSI_OFFSET + hal.readRegister(SX127X_REG_RSSI_VALUE, radioNumber));
 }
 
 int8_t ICACHE_RAM_ATTR SX127xDriver::GetLastPacketSNRRaw(SX12XX_Radio_Number_t radioNumber)

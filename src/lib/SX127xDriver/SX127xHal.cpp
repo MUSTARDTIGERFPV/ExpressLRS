@@ -72,6 +72,17 @@ void SX127xHal::reset(void)
 {
     DBGLN("SX127x Reset");
 
+#if defined(RADIO_SX1272)
+    // SX1272 NRESET is active high: drive high >= 100 us, release, wait 5 ms
+    if (GPIO_PIN_RST != UNDEF_PIN)
+    {
+        pinMode(GPIO_PIN_RST, OUTPUT);
+        digitalWrite(GPIO_PIN_RST, HIGH);
+        delayMicroseconds(200);
+        digitalWrite(GPIO_PIN_RST, LOW);
+        delay(6);
+    }
+#else
     if (GPIO_PIN_RST != UNDEF_PIN)
     {
         pinMode(GPIO_PIN_RST, OUTPUT);
@@ -88,6 +99,7 @@ void SX127xHal::reset(void)
             pinMode(GPIO_PIN_RST_2, INPUT);
         }
     }
+#endif
 
     DBGLN("SX127x Ready!");
 }

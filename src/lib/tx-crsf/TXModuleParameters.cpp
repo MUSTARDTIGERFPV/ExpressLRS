@@ -848,6 +848,7 @@ void TXModuleEndpoint::registerParameters()
         SetAntennaMode(arg);
       });
     }
+#if !defined(PLATFORM_TANGO2)   // no MAVLink parser in the Tango 2 image
     registerParameter(&luaLinkMode, [this](propertiesCommon *item, uint8_t arg) {
       // Only allow changing when disconnected since we need to guarantee
       // the switch pack and unpack functions are matched on the tx and rx.
@@ -861,6 +862,7 @@ void TXModuleEndpoint::registerParameters()
         setWarningFlag(LUA_FLAG_ERROR_CONNECTED, true);
       }
     });
+#endif
     if (!firmwareOptions.is_airport)
     {
       registerParameter(&luaModelMatch, [this](propertiesCommon *item, uint8_t arg) {
@@ -920,7 +922,9 @@ void TXModuleEndpoint::registerParameters()
 
   // WIFI folder
   registerParameter(&luaWiFiFolder);
+#if !defined(PLATFORM_TANGO2)   // the TX itself has no WiFi
   registerParameter(&luaWebUpdate, wifiBleCallback, luaWiFiFolder.common.id);
+#endif
   if (HAS_RADIO) {
     registerParameter(&luaRxWebUpdate, sendCallback, luaWiFiFolder.common.id);
 

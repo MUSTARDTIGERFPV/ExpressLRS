@@ -811,7 +811,7 @@ static void CheckConfigChangePending()
       return;
 
     // wait until no longer transmitting
-    while (busyTransmitting);
+    while (busyTransmitting) yield();
     // Set the commitInProgress flag to prevent any other RF SPI traffic during the commit from RX or scheduled TX
     commitInProgress = true;
     // If telemetry expected in the next interval, the radio was in RX mode
@@ -981,7 +981,7 @@ static void EnterBindingMode()
 
   // Disable the TX timer and wait for any TX to complete
   hwTimer::stop();
-  while (busyTransmitting);
+  while (busyTransmitting) yield();
 
   // Queue up sending the Master UID as MSP packets
   SendUIDOverMSP();
@@ -1222,6 +1222,10 @@ static void setupSerial()
   {
     serialPort = new NullStream();
   }
+#elif defined(PLATFORM_TANGO2)
+  // log text goes to host->log via the image's log ring
+  extern Stream *tango2_log_stream;
+  Stream *serialPort = tango2_log_stream;
 #endif
   BackpackOrLogStrm = serialPort;
 
@@ -1320,6 +1324,9 @@ static void setupBindingFromConfig()
   {
 #if defined(PLATFORM_ESP32)
     esp_read_mac(UID, ESP_MAC_WIFI_STA);
+#elif defined(PLATFORM_TANGO2)
+    extern void tango2_get_uid(uint8_t uid[6]);
+    tango2_get_uid(UID);
 #else
     wifi_get_macaddr(STATION_IF, UID);
 #endif
@@ -1388,6 +1395,11 @@ void setup()
 
     setupBindingFromConfig();
     FHSSrandomiseFHSSsequence(OtaGetUidSeed());
+#if defined(PLATFORM_TANGO2)
+    // per-unit crystal error from the host, applied to every FHSS frequency
+    extern void tango2_apply_crystal_correction();
+    tango2_apply_crystal_correction();
+#endif
 
     Radio.RXdoneCallback = &RXdoneISR;
     Radio.TXdoneCallback = &TXdoneISR;

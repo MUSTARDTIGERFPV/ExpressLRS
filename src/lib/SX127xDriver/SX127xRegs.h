@@ -276,6 +276,10 @@ typedef enum
 #define SX1272_RX_CRC_MODE_ON 0b00000010  //  1     1     CRC enabled
 #define SX1272_RX_CRC_MODE_MASK 0b00000010
 
+//SX1272_REG_MODEM_CONFIG_2 (the SX1272 has no ModemConfig3)
+#define SX1272_AGC_AUTO_ON 0b00000100          //  2     2     LNA gain set by internal AGC loop
+#define SX1272_AGC_AUTO_MASK 0b00000100
+
 //SX1278_REG_MODEM_CONFIG_3
 #define SX1278_LOW_DATA_RATE_OPT_OFF 0b00000000 //  3     3     low data rate optimization disabled
 #define SX1278_LOW_DATA_RATE_OPT_ON 0b00001000  //  3     3     low data rate optimization enabled

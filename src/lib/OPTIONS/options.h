@@ -56,7 +56,10 @@ extern char device_name[];
 extern firmware_options_t firmwareOptions;
 extern bool options_init();
 
-#if !defined(UNIT_TEST)
+#if defined(PLATFORM_TANGO2)
+extern char product_name[];
+extern void saveOptions();
+#elif !defined(UNIT_TEST)
 extern char product_name[];
 extern uint32_t logo_image;
 extern String& getOptions();
