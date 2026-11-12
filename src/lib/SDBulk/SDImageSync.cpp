@@ -223,6 +223,18 @@ static FetchResult fetchImage(SDBulkLink &link, const String &url, const char *k
     return link.rename(part, path) == SDBulk::OK ? FETCH_OK : FETCH_FAILED;
 }
 
+void imageSyncNetwork(char *ssid, size_t len)
+{
+    Preferences prefs;
+    String last;
+    if (prefs.begin("sdsync", true))
+    {
+        last = prefs.getString("ssid", "");
+        prefs.end();
+    }
+    snprintf(ssid, len, "%s", last.isEmpty() ? firmwareOptions.home_wifi_ssid : last.c_str());
+}
+
 bool runImageSync(SDBulkLink &link, const char *manifestUrl, char *result, size_t resultLen)
 {
     lastCall = millis();
@@ -272,6 +284,9 @@ bool runImageSync(SDBulkLink &link, const char *manifestUrl, char *result, size_
         link.end(1, result);
         return false;
     }
+    // for the menu label; only written when it changes
+    if (prefs.getString("ssid", "") != ssid)
+        prefs.putString("ssid", ssid);
 
     // the manifest is small; take it whole
     keepalive(link, "Fetching manifest", 0, 0, true);

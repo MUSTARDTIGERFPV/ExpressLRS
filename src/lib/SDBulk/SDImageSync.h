@@ -17,4 +17,9 @@
 
 bool runImageSync(SDBulkLink &link, const char *manifestUrl, char *result, size_t resultLen);
 
+// The network a sync will most likely join, for the menu: the last one joined (it may
+// have come from WIFI.TXT, which can't be read outside a session), else the home
+// network from the firmware options. Empty if there's neither.
+void imageSyncNetwork(char *ssid, size_t len);
+
 #endif

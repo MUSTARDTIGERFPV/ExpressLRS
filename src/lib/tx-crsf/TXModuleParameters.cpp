@@ -1,6 +1,7 @@
 #include "TXModuleEndpoint.h"
 #if defined(PLATFORM_ESP32)
 #include "SDSession.h"
+#include "SDImageSync.h"
 #endif
 
 #include "rxtx_intf.h"
@@ -236,6 +237,25 @@ static commandParameter luaRxFwSync = {
     lcsIdle, // step
     STR_EMPTYSPACE
 };
+
+#if defined(PLATFORM_ESP32)
+// "Sync from WiFi (network)". The Lua draws command names unclipped, so a long SSID
+// is cut to 14 characters: the line then fits a color screen, and on a 128 px
+// one it runs off the edge after "Sync from WiFi" rather than wrapping.
+static void updateSyncLabel()
+{
+  static char label[32];
+  char ssid[33];
+  imageSyncNetwork(ssid, sizeof(ssid));
+  if (ssid[0] == '\0')
+    snprintf(label, sizeof(label), "Sync from WiFi");
+  else if (strlen(ssid) > 14)
+    snprintf(label, sizeof(label), "Sync from WiFi (%.12s..)", ssid);
+  else
+    snprintf(label, sizeof(label), "Sync from WiFi (%s)", ssid);
+  luaRxFwSync.common.name = label;
+}
+#endif
 //---------------------------- Receiver firmware ------------------
 
 static commandParameter luaBLEJoystick = {
@@ -582,7 +602,11 @@ void TXModuleEndpoint::handleSdSession(propertiesCommon *item, uint8_t arg)
       if (SDSession::busy() || millis() - SDSession::finishedAt() < RESULT_SHOW_MS)
         sendCommandResponse(cmd, lcsExecuting, SDSession::statusText());
       else
+      {
+        // a sync may have joined a different network (WIFI.TXT)
+        updateSyncLabel();
         sendCommandResponse(cmd, lcsIdle, STR_EMPTYSPACE);
+      }
       break;
   }
 }
@@ -989,6 +1013,7 @@ void TXModuleEndpoint::registerParameters()
   registerParameter(&luaRxFwFolder);
   if (HAS_RADIO)
     registerParameter(&luaRxFwUpdate, sdSessionCallback, luaRxFwFolder.common.id);
+  updateSyncLabel();
   registerParameter(&luaRxFwSync, sdSessionCallback, luaRxFwFolder.common.id);
 #endif
 
