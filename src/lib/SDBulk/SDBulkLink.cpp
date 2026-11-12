@@ -212,6 +212,8 @@ void SDBulkLink::end(uint8_t result, const char *text)
     b[0] = result;
     const size_t tl = strnlen(text, 48);
     memcpy(&b[1], text, tl);
+    memcpy(endText, text, tl);
+    endText[tl] = 0;
     call(SDBulk::END, b, 1 + tl, nullptr, nullptr, 100, 3);
 }
 

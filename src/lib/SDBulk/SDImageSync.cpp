@@ -8,6 +8,7 @@
 
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <Preferences.h>
 #include <WiFi.h>
 #include <mbedtls/sha256.h>
 
@@ -251,6 +252,12 @@ bool runImageSync(SDBulkLink &link, const char *manifestUrl, char *result, size_
         if (l3 && url.isEmpty())
             url = l3;
     }
+    // No URL from the request or the card: use the last one that synced fine. Until
+    // releases publish a manifest at a fixed address, that's the menu's default.
+    Preferences prefs;
+    prefs.begin("sdsync", false);
+    if (url.isEmpty())
+        url = prefs.getString("url", "");
     if (ssid.isEmpty() || url.isEmpty())
     {
         snprintf(result, resultLen, ssid.isEmpty() ? "no WiFi network set" : "no manifest URL set");
@@ -336,6 +343,10 @@ bool runImageSync(SDBulkLink &link, const char *manifestUrl, char *result, size_
         link.mkdir("FIRMWARE");
         writeFileAtomically(link, "FIRMWARE/manifest.json", (const uint8_t *)manifest.c_str(), manifest.length());
     }
+
+    if (!cancelled && !failed)
+        prefs.putString("url", url);
+    prefs.end();
 
     if (cancelled)
         snprintf(result, resultLen, "Cancelled");

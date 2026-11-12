@@ -88,6 +88,8 @@ public:
 
     uint16_t maxPayload = SDBulk::MAX_PAYLOAD;
     uint32_t retries = 0;
+    // what end() last told the handset; it's also the line to show a person
+    char endText[49] = "";
     uint32_t calls = 0;
 
 private:

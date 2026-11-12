@@ -41,6 +41,8 @@ static char jobPath[65] = "";  // file for KIND_TEST, manifest URL for KIND_IMAG
 static char result[96];
 static volatile bool resultPending = false;
 static uint32_t restoredAt = 0;
+static uint32_t lastFinished = 0;
+static SDBulkLink *link = nullptr; // the job task's; outlives the task for statusText()
 static uint32_t prepareStart = 0;
 static bool rxCommandSent = false;
 
@@ -74,6 +76,46 @@ void setTransport(SDBulkTransport *t)
     transport = t;
 }
 
+bool requestSession(uint8_t k, const char *arg, crsf_addr_e to)
+{
+    if (state != IDLE)
+        return false;
+    reportTo = to;
+    kind = k;
+    snprintf(jobPath, sizeof(jobPath), "%s", arg ? arg : "");
+    result[0] = 0;
+    requestStart = millis();
+    requestLast = 0;
+    state = REQUESTING;
+    report("requesting session");
+    return true;
+}
+
+bool busy()
+{
+    return state != IDLE;
+}
+
+const char *statusText()
+{
+    switch (state)
+    {
+    case REQUESTING: return "Asking radio...";
+    case PREPARING_RX: return "Telling receiver...";
+    case ACCEPTING:
+    case ACTIVE:
+    case FINISHED: return "Running...";
+    default:
+        // the line the handset showed the user beats our terse USB status
+        return (link && link->endText[0]) ? link->endText : result;
+    }
+}
+
+uint32_t finishedAt()
+{
+    return lastFinished;
+}
+
 void handleCrsf(const crsf_ext_header_t *message)
 {
     const uint8_t sub = message->payload[0];
@@ -82,18 +124,14 @@ void handleCrsf(const crsf_ext_header_t *message)
     if (message->orig_addr != CRSF_ADDRESS_RADIO_TRANSMITTER)
     {
         // USB (or anything else that isn't the handset) asking us to start one:
-        // [REQUEST][kind][path...]
-        if (sub == SUB_REQUEST && state == IDLE)
+        // [REQUEST][kind][arg...]
+        if (sub == SUB_REQUEST)
         {
-            reportTo = message->orig_addr;
-            kind = argLen ? message->payload[1] : KIND_IMAGE_SYNC;
-            const size_t pl = argLen > 1 ? std::min<size_t>(argLen - 1, sizeof(jobPath) - 1) : 0;
-            memcpy(jobPath, &message->payload[2], pl);
-            jobPath[pl] = '\0';
-            requestStart = millis();
-            requestLast = 0;
-            state = REQUESTING;
-            report("requesting session");
+            char arg[sizeof(jobPath)];
+            const size_t pl = argLen > 1 ? std::min<size_t>(argLen - 1, sizeof(arg) - 1) : 0;
+            memcpy(arg, &message->payload[2], pl);
+            arg[pl] = '\0';
+            requestSession(argLen ? message->payload[1] : KIND_IMAGE_SYNC, arg, (crsf_addr_e)message->orig_addr);
         }
         return;
     }
@@ -106,6 +144,8 @@ void handleCrsf(const crsf_ext_header_t *message)
             const uint8_t body[] = {message->payload[1], 1, 'A', 'r', 'm', 'e', 'd'};
             sendSd(CRSF_ADDRESS_RADIO_TRANSMITTER, SUB_REJECT, body, sizeof(body));
             state = IDLE;
+            snprintf(result, sizeof(result), "Armed");
+            lastFinished = millis();
             report("offer rejected: armed");
             return;
         }
@@ -122,6 +162,8 @@ void handleCrsf(const crsf_ext_header_t *message)
                 const uint8_t body[] = {kind, 2, 'N', 'o', ' ', 'r', 'e', 'c', 'e', 'i', 'v', 'e', 'r'};
                 sendSd(CRSF_ADDRESS_RADIO_TRANSMITTER, SUB_REJECT, body, sizeof(body));
                 state = IDLE;
+                snprintf(result, sizeof(result), "No receiver connected");
+                lastFinished = millis();
                 report("offer rejected: no receiver");
                 return;
             }
@@ -145,6 +187,8 @@ void loop(uint32_t now)
         if ((int32_t)(now - requestStart) > (int32_t)REQUEST_TIMEOUT_MS)
         {
             state = IDLE;
+            snprintf(result, sizeof(result), "No answer from radio");
+            lastFinished = now;
             report("no offer from handset");
         }
         else if ((int32_t)(now - requestLast) >= (int32_t)REQUEST_INTERVAL_MS)
@@ -178,6 +222,8 @@ void loop(uint32_t now)
             const uint8_t body[] = {kind, 3, 'R', 'X', ' ', 'n', 'o', ' ', 'a', 'c', 'k'};
             sendSd(CRSF_ADDRESS_RADIO_TRANSMITTER, SUB_REJECT, body, sizeof(body));
             state = IDLE;
+            snprintf(result, sizeof(result), "Receiver did not respond");
+            lastFinished = now;
             report("RX did not ack the update command");
         }
     }
@@ -299,10 +345,10 @@ static bool runJob(SDBulkLink &link)
 
 static void jobTask(void *)
 {
-    static SDBulkLink *link = nullptr;
     if (!link)
         link = new SDBulkLink(transport);
     link->retries = link->calls = 0;
+    link->endText[0] = 0;
     link->maxPayload = SDBulk::MAX_PAYLOAD;
 
     if (kind == KIND_TEST)
@@ -344,6 +390,7 @@ bool portReleased()
 void portRestored()
 {
     state = IDLE;
+    lastFinished = millis();
     restoredAt = millis();
 }
 

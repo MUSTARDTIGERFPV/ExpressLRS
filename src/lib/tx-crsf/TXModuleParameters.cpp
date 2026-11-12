@@ -1,4 +1,7 @@
 #include "TXModuleEndpoint.h"
+#if defined(PLATFORM_ESP32)
+#include "SDSession.h"
+#endif
 
 #include "rxtx_intf.h"
 #include "CRSFHandset.h"
@@ -216,6 +219,25 @@ static commandParameter luaVRxBackpackUpdate = {
 //---------------------------- WiFi -----------------------------
 
 #if defined(PLATFORM_ESP32)
+//---------------------------- Receiver firmware ------------------
+// Both run as an SD session: the radio lends us /ELRS/ on its card
+static folderParameter luaRxFwFolder = {
+    {"Receiver Firmware", CRSF_FOLDER}
+};
+
+static commandParameter luaRxFwUpdate = {
+    {"Update Receiver", CRSF_COMMAND},
+    lcsIdle, // step
+    STR_EMPTYSPACE
+};
+
+static commandParameter luaRxFwSync = {
+    {"Sync from WiFi", CRSF_COMMAND},
+    lcsIdle, // step
+    STR_EMPTYSPACE
+};
+//---------------------------- Receiver firmware ------------------
+
 static commandParameter luaBLEJoystick = {
     {"BLE Joystick", CRSF_COMMAND},
     lcsIdle, // step
@@ -526,6 +548,46 @@ void TXModuleEndpoint::handleWifiBle(propertiesCommon *item, uint8_t arg)
   }
 }
 
+#if defined(PLATFORM_ESP32)
+void TXModuleEndpoint::handleSdSession(propertiesCommon *item, uint8_t arg)
+{
+  auto cmd = (commandParameter *)item;
+  const bool update = (void *)item == (void *)&luaRxFwUpdate;
+  // how long the result of a finished session stays up in the Lua
+  constexpr uint32_t RESULT_SHOW_MS = 4000;
+
+  switch ((commandStep_e)arg)
+  {
+    case lcsClick:
+      if (update)
+      {
+        // a fat-fingered press shouldn't reboot a receiver
+        sendCommandResponse(cmd, lcsAskConfirm, "Update RX from SD card?");
+        return;
+      }
+      // fallthrough: syncing touches nothing but the card
+
+    case lcsConfirmed:
+      if (SDSession::requestSession(update ? SDSession::KIND_RX_UPDATE : SDSession::KIND_IMAGE_SYNC, ""))
+        sendCommandResponse(cmd, lcsExecuting, SDSession::statusText());
+      else
+        sendCommandResponse(cmd, lcsIdle, "Busy");
+      break;
+
+    case lcsCancel:
+      sendCommandResponse(cmd, lcsIdle, STR_EMPTYSPACE);
+      break;
+
+    default: // lcsQuery from our lua while executing
+      if (SDSession::busy() || millis() - SDSession::finishedAt() < RESULT_SHOW_MS)
+        sendCommandResponse(cmd, lcsExecuting, SDSession::statusText());
+      else
+        sendCommandResponse(cmd, lcsIdle, STR_EMPTYSPACE);
+      break;
+  }
+}
+#endif
+
 void TXModuleEndpoint::handleSimpleSendCmd(propertiesCommon *item, uint8_t arg)
 {
   const char *msg = "Sending...";
@@ -788,6 +850,9 @@ void TXModuleEndpoint::registerParameters()
 {
   auto wifiBleCallback = [&](propertiesCommon *item, const uint8_t arg) { handleWifiBle(item, arg); };
   auto sendCallback = [&](propertiesCommon *item, const uint8_t arg) { handleSimpleSendCmd(item, arg); };
+#if defined(PLATFORM_ESP32)
+  auto sdSessionCallback = [&](propertiesCommon *item, const uint8_t arg) { handleSdSession(item, arg); };
+#endif
 
   if (HAS_RADIO) {
 #if defined(RADIO_LR1121) || defined(RADIO_LR2021)
@@ -917,6 +982,15 @@ void TXModuleEndpoint::registerParameters()
     }, luaVtxFolder.common.id);
     registerParameter(&luaVtxSend, sendCallback, luaVtxFolder.common.id);
   }
+
+#if defined(PLATFORM_ESP32)
+  // Receiver firmware folder: needs a handset with SD session support, which will
+  // simply never offer one otherwise
+  registerParameter(&luaRxFwFolder);
+  if (HAS_RADIO)
+    registerParameter(&luaRxFwUpdate, sdSessionCallback, luaRxFwFolder.common.id);
+  registerParameter(&luaRxFwSync, sdSessionCallback, luaRxFwFolder.common.id);
+#endif
 
   // WIFI folder
   registerParameter(&luaWiFiFolder);

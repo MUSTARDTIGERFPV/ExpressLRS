@@ -54,6 +54,9 @@ private:
 
     void handleWifiBle(propertiesCommon *item, uint8_t arg);
     void handleSimpleSendCmd(propertiesCommon *item, uint8_t arg);
+#if defined(PLATFORM_ESP32)
+    void handleSdSession(propertiesCommon *item, uint8_t arg);
+#endif
     void updateTlmBandwidth();
     void updateBackpackOpts();
     void updateVtxAdminOpts();

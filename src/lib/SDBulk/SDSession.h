@@ -37,6 +37,16 @@ enum Kind : uint8_t
 
 void setTransport(SDBulkTransport *transport);
 
+// Ask the handset for a session (Lua command, USB). `arg` is the job's argument:
+// card path for RX_UPDATE/TEST, manifest URL for IMAGE_SYNC; may be empty.
+// Status lines go to `reportTo` when it isn't the broadcast address.
+bool requestSession(uint8_t kind, const char *arg, crsf_addr_e reportTo = CRSF_ADDRESS_BROADCAST);
+bool busy();
+// short human-readable state ("Waiting for radio", the last result, ...) and when the
+// last session finished (0 if none yet)
+const char *statusText();
+uint32_t finishedAt();
+
 // A CRSF_FRAMETYPE_SD_SESSION frame for the TX module, from the handset or from USB
 void handleCrsf(const crsf_ext_header_t *message);
 
