@@ -6,8 +6,10 @@
 #include <esp_wifi_types.h>
 #endif
 
-// TX -> RX firmware transfer over ESP-NOW, after the RX was told over the RC link
-// (MSP_ELRS_ENTER_RX_UPDATE) to stop the radio and listen.
+// TX -> RX firmware transfer over ESP-NOW. The RX listens either after it was told
+// over the RC link (MSP_ELRS_ENTER_RX_UPDATE) to stop the radio, or for a moment
+// after every boot (BOOT_LISTEN_MS), which reaches an RX that can't link at all:
+// one a major version ahead of or behind the TX, say.
 //
 // The RX takes a station MAC derived from the binding UID, so the TX knows where to
 // send without any discovery, and only a TX with the same bind phrase can reach it.
@@ -17,13 +19,24 @@
 //   TX  BEGIN(size)  ->  RX  BEGIN_ACK
 //   TX  DATA(off)    ->  RX  DATA_ACK(next expected offset)   ... up to WINDOW in flight
 //   TX  FINISH(sha)  ->  RX  FINISH_ACK(status, text), then the RX reboots into it
+//   TX  CANCEL_UPDATE(why)  ->  RX  CANCEL_UPDATE_ACK, then the RX reboots into what it has
+//
+// This protocol has to outlive the RC link protocol: an RX that can't link is
+// exactly the one that needs it. So it only ever grows. Packets keep their types
+// and fields, new fields go on the end, and both sides ignore what they don't know.
+// PROTO_VERSION in HELLO/HELLO_ACK (0 from the first receivers, which don't send it)
+// says what the other end understands.
 //
 // The image is the bare firmware (no options/hardware trailer); the RX appends its
 // own trailer so it keeps its layout, bind phrase and settings.
 
 namespace RxUpdate
 {
+constexpr uint8_t PROTO_VERSION = 1;
 constexpr uint8_t ESPNOW_CHANNEL = 1;
+// how long an RX listens for a HELLO after boot, alongside starting the link; the
+// first valid RC packet ends it early
+constexpr uint32_t BOOT_LISTEN_MS = 1500;
 constexpr uint8_t MAGIC0 = 'E', MAGIC1 = 'U';
 constexpr uint16_t DATA_MAX = 232;
 // packets the TX keeps in flight; the RX acks cumulatively ("next offset I expect")
@@ -50,6 +63,19 @@ enum Type : uint8_t
     DATA_ACK,
     FINISH,
     FINISH_ACK,
+    CANCEL_UPDATE,
+    CANCEL_UPDATE_ACK,
+};
+
+// Cancel.reason: why the TX gave up, so the RX's log says the same as the handset
+enum CancelReason : uint8_t
+{
+    CANCEL_USER = 0,     // the user cancelled on the handset
+    CANCEL_NO_IMAGE,     // nothing on the card for this RX
+    CANCEL_BAD_IMAGE,    // wrong format, or too big for this RX
+    CANCEL_CARD_ERROR,   // reading the card failed
+    CANCEL_TRANSFER,     // the transfer itself failed
+    CANCEL_OTHER,
 };
 
 enum Status : uint8_t
@@ -70,6 +96,12 @@ struct __attribute__((packed)) Header
     uint8_t seq;
 };
 
+struct __attribute__((packed)) Hello
+{
+    Header h;
+    uint8_t proto;     // PROTO_VERSION; absent (0) from the first transmitters
+};
+
 struct __attribute__((packed)) HelloAck
 {
     Header h;
@@ -78,6 +110,7 @@ struct __attribute__((packed)) HelloAck
     char commit[8];
     uint32_t maxImage;
     uint8_t flags;     // FLAG_*; absent (0) from older receivers
+    uint8_t proto;     // PROTO_VERSION; absent (0) from older receivers
 };
 
 struct __attribute__((packed)) Begin
@@ -117,6 +150,13 @@ struct __attribute__((packed)) FinishAck
     Header h;
     uint8_t status;
     char text[40];
+};
+
+struct __attribute__((packed)) Cancel
+{
+    Header h;
+    uint8_t reason;    // CancelReason
+    char text[40];     // what the handset shows, NUL-terminated
 };
 
 inline void macFromUid(const uint8_t *uid, uint8_t *mac)

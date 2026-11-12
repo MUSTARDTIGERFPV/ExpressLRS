@@ -64,6 +64,12 @@ static bool finished = false;
 static FinishAck finishResult;
 static br_sha256_context sha;
 static uint32_t rebootAt = 0;
+static bool espNowUp = false;
+static uint8_t originalMac[6];
+static bool bootListening = false;
+static uint32_t bootListenEnd = 0;
+
+extern uint32_t LastValidPacket;
 
 static void onRecv(uint8_t *mac, uint8_t *data, uint8_t len)
 {
@@ -92,13 +98,43 @@ static void header(Header &h, Type t, uint8_t seq)
     h.seq = seq;
 }
 
-bool RxUpdateReceiver::enter()
+// Station on ESPNOW_CHANNEL with the MAC derived from the bind UID, so the TX can
+// address us without any discovery
+static void startEspNow()
 {
-    if (CRSF_to_BIT(ChannelData[4]))
-    {
-        DBGLN("RX update refused: armed");
-        return false;
-    }
+    if (espNowUp)
+        return;
+    uint8_t mac[6];
+    macFromUid(UID, mac);
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    wifi_get_macaddr(STATION_IF, originalMac);
+    wifi_set_macaddr(STATION_IF, mac);
+    wifi_set_channel(ESPNOW_CHANNEL);
+    esp_now_init();
+    esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
+    esp_now_register_recv_cb(onRecv);
+    espNowUp = true;
+}
+
+// Back to how devWIFI left it: off, and with our own MAC should it start WiFi later
+static void stopEspNow()
+{
+    if (!espNowUp)
+        return;
+    esp_now_unregister_recv_cb();
+    esp_now_deinit();
+    wifi_set_macaddr(STATION_IF, originalMac);
+    WiFi.mode(WIFI_OFF);
+    WiFi.forceSleepBegin();
+    espNowUp = false;
+    havePeer = false;
+    ringHead = ringTail = 0;
+}
+
+static void enterUpdateMode()
+{
     setConnectionState(rxUpdate);
     hwTimer::stop();
     Radio.End();
@@ -107,20 +143,57 @@ bool RxUpdateReceiver::enter()
     Serial.end();
     Serial.begin(115200);
 
+    startEspNow();
     uint8_t mac[6];
-    macFromUid(UID, mac);
-    WiFi.persistent(false);
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-    const bool macOk = wifi_set_macaddr(STATION_IF, mac);
-    const bool chOk = wifi_set_channel(ESPNOW_CHANNEL);
-    const int nowErr = esp_now_init();
-    esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
-    esp_now_register_recv_cb(onRecv);
-    RXU_LOG("enter: mac %02x:%02x:%02x:%02x:%02x:%02x (set %d) ch %u (set %d) espnow %d free %u\n", mac[0], mac[1],
-            mac[2], mac[3], mac[4], mac[5], macOk, wifi_get_channel(), chOk, nowErr, ESP.getFreeSketchSpace());
+    wifi_get_macaddr(STATION_IF, mac);
+    RXU_LOG("enter: mac %02x:%02x:%02x:%02x:%02x:%02x ch %u free %u\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            wifi_get_channel(), ESP.getFreeSketchSpace());
     lastPacket = millis();
+}
+
+bool RxUpdateReceiver::enter()
+{
+    if (CRSF_to_BIT(ChannelData[4]))
+    {
+        DBGLN("RX update refused: armed");
+        return false;
+    }
+    enterUpdateMode();
     return true;
+}
+
+void RxUpdateReceiver::bootListen()
+{
+    startEspNow();
+    bootListening = true;
+    bootListenEnd = millis() + BOOT_LISTEN_MS;
+}
+
+void RxUpdateReceiver::bootListenLoop(uint32_t now)
+{
+    if (!bootListening)
+        return;
+    // A TX is talking to us over the link: that wins, WiFi goes back off. (A TX
+    // looking for us over ESP-NOW has its radio off, so the two can't both happen.)
+    if (LastValidPacket != 0 || (int32_t)(now - bootListenEnd) > 0)
+    {
+        bootListening = false;
+        stopEspNow();
+        return;
+    }
+    // A HELLO for us: become the update receiver, loop() answers it. The TX repeats
+    // HELLO until it hears back, so only the newest one is worth keeping.
+    for (uint8_t i = ringTail; i != ringHead; i = (i + 1) % RING)
+    {
+        if (((const Header *)ring[i].data)->type == HELLO)
+        {
+            bootListening = false;
+            ringTail = i;
+            enterUpdateMode();
+            RXU_LOG("TX found us during boot\n");
+            return;
+        }
+    }
 }
 
 static void addPeer(const uint8_t *mac)
@@ -211,6 +284,7 @@ static void handle(const Packet &p)
         // same margin the web updater uses
         a.maxImage = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
         a.flags = FLAG_WANTS_GZIP;
+        a.proto = PROTO_VERSION;
         send(&a, sizeof(a));
         break;
     }
@@ -282,6 +356,26 @@ static void handle(const Packet &p)
         }
         header(finishResult.h, FINISH_ACK, h->seq);
         send(&finishResult, sizeof(finishResult));
+        break;
+    }
+
+    case CANCEL_UPDATE:
+    {
+        const auto c = (const Cancel *)p.data;
+        char why[sizeof(c->text) + 1] = {};
+        if (p.len > offsetof(Cancel, text))
+            memcpy(why, c->text, std::min<size_t>(sizeof(c->text), p.len - offsetof(Cancel, text)));
+        RXU_LOG("cancelled by TX (%u): %s\n", p.len > offsetof(Cancel, reason) ? c->reason : CANCEL_OTHER, why);
+        StatusOnly a;
+        header(a.h, CANCEL_UPDATE_ACK, h->seq);
+        a.status = ST_OK;
+        send(&a, sizeof(a));
+        // Never Update.end() here, that would have eboot copy a partial image. A
+        // finished update is already scheduled and stays that way.
+        started = false;
+        // a moment to answer a repeated CANCEL_UPDATE whose ACK got lost
+        if (!rebootAt)
+            rebootAt = millis() + 1000;
         break;
     }
     }

@@ -23,6 +23,8 @@ using namespace RxUpdate;
 
 static constexpr uint32_t KEEPALIVE_MS = 800;
 static constexpr uint32_t FIND_RX_TIMEOUT_MS = 10000;
+// how long to wait for someone to power the receiver on
+static constexpr uint32_t FIND_BOOTING_RX_TIMEOUT_MS = 30000;
 
 static QueueHandle_t ackQueue;
 static volatile uint32_t sendOk = 0, sendFail = 0;
@@ -133,6 +135,19 @@ static void stopEspNow()
         vQueueDelete(ackQueue);
         ackQueue = nullptr;
     }
+}
+
+// Tell the RX we're giving up, so it reboots into what it has now rather than sitting
+// in update mode until its idle timeout. Best effort: an RX that's gone is fine too.
+static void cancelRx(CancelReason reason, const char *text)
+{
+    Cancel c = {};
+    c.h.type = CANCEL_UPDATE;
+    c.reason = reason;
+    strncpy(c.text, text, sizeof(c.text) - 1);
+    Reply r;
+    xQueueReset(ackQueue);
+    exchange(&c, sizeof(c), CANCEL_UPDATE_ACK, r, 200, 3);
 }
 
 // newest image for this key: the lexically greatest finished file in the directory
@@ -282,12 +297,12 @@ private:
 
 static ImageSource *src;
 
-bool runRxUpdate(SDBulkLink &link, const char *path, char *result, size_t resultLen)
+bool runRxUpdate(SDBulkLink &link, const char *path, bool linked, char *result, size_t resultLen)
 {
     lastCall = millis();
     if (link.hello() != SDBulk::OK)
     {
-        snprintf(result, resultLen, "HELLO failed");
+        snprintf(result, resultLen, "Radio didn't answer");
         return false;
     }
 
@@ -297,34 +312,42 @@ bool runRxUpdate(SDBulkLink &link, const char *path, char *result, size_t result
         link.end(1, msg);
         return false;
     };
+    // once the RX may be in update mode: let it go before we do
+    auto failRx = [&](CancelReason reason, const char *msg) {
+        cancelRx(reason, msg);
+        return fail(msg);
+    };
 
     if (!startEspNow())
         return fail("ESP-NOW init failed");
 
-    // find the receiver: it switches over ~0.5 s after acking the link command
+    // Find the receiver. A linked one switches over ~0.5 s after acking the link
+    // command; any other listens for BOOT_LISTEN_MS after power-on, so ask often.
     Reply r;
     HelloAck info = {};
-    keepalive(link, "Finding receiver", 0, 0, true);
+    const char *finding = linked ? "Finding receiver" : "Power on the receiver now";
+    keepalive(link, finding, 0, 0, true);
     const uint32_t t0 = millis();
     bool found = false;
-    while (!found && millis() - t0 < FIND_RX_TIMEOUT_MS)
+    while (!found && millis() - t0 < (linked ? FIND_RX_TIMEOUT_MS : FIND_BOOTING_RX_TIMEOUT_MS))
     {
-        Header hello = {};
-        hello.type = HELLO;
-        if (exchange(&hello, sizeof(hello), HELLO_ACK, r, 150, 1))
+        Hello hello = {};
+        hello.h.type = HELLO;
+        hello.proto = PROTO_VERSION;
+        if (exchange(&hello, sizeof(hello), HELLO_ACK, r, linked ? 150 : 50, 1))
         {
             memcpy(&info, r.data, std::min<size_t>(r.len, sizeof(info)));
             found = true;
         }
-        if (keepalive(link, "Finding receiver") == SDBulk::CANCELLED)
-            return fail("Cancelled");
+        if (keepalive(link, finding) == SDBulk::CANCELLED)
+            return failRx(CANCEL_USER, "Cancelled");
     }
     if (!found)
     {
-        char msg[64];
-        snprintf(msg, sizeof(msg), "Receiver did not answer (%02x:%02x tx ok %u fail %u)", rxMac[4], rxMac[5],
-                 (unsigned)sendOk, (unsigned)sendFail);
-        return fail(msg);
+        DBGLN("RX update: no answer from %02x:%02x (tx ok %u fail %u)", rxMac[4], rxMac[5], (unsigned)sendOk,
+              (unsigned)sendFail);
+        // a linked RX that did switch over but can't hear us still gets told
+        return linked ? failRx(CANCEL_OTHER, "Receiver not found") : fail("Receiver not found at power-on");
     }
     info.key[sizeof(info.key) - 1] = info.version[sizeof(info.version) - 1] = '\0';
     char rxCommit[9] = {};
@@ -337,25 +360,24 @@ bool runRxUpdate(SDBulkLink &link, const char *path, char *result, size_t result
         snprintf(imagePath, sizeof(imagePath), "%s", path);
     else if (!pickImage(link, info.key, wantsGzip, imagePath, sizeof(imagePath)))
     {
-        snprintf(result, resultLen, "no image for %.16s", info.key);
-        stopEspNow();
-        link.end(1, result);
-        return false;
+        char msg[48];
+        snprintf(msg, sizeof(msg), "No %.16s image on SD - sync first", info.key);
+        return failRx(CANCEL_NO_IMAGE, msg);
     }
 
     if (!src)
         src = new ImageSource();
     const size_t ipl = strlen(imagePath);
     if (wantsGzip && !(ipl > 3 && strcmp(imagePath + ipl - 3, ".gz") == 0))
-        return fail("RX needs a .bin.gz image");
+        return failRx(CANCEL_BAD_IMAGE, "RX needs a .bin.gz image");
     // "rawSize" is what goes over the air: the inflated image, or the .gz itself
     uint32_t rawSize = 0;
     if (!src->open(link, imagePath, rawSize, wantsGzip))
-        return fail("Can't open image");
+        return failRx(CANCEL_CARD_ERROR, "Can't read image from SD");
     if (rawSize > info.maxImage)
     {
         src->close();
-        return fail("Image too big for RX");
+        return failRx(CANCEL_BAD_IMAGE, "Image too big for RX");
     }
 
     // The RX erases the whole target range before it answers (~1-2 s per MB); the
@@ -379,7 +401,7 @@ bool runRxUpdate(SDBulkLink &link, const char *path, char *result, size_t result
     if (!begun)
     {
         src->close();
-        return fail("RX refused the image");
+        return failRx(CANCEL_BAD_IMAGE, "RX refused the image");
     }
 
     mbedtls_sha256_context sha;
@@ -399,6 +421,7 @@ bool runRxUpdate(SDBulkLink &link, const char *path, char *result, size_t result
     bool eof = false;
     const uint32_t ts = millis();
     bool ok = true;
+    bool cancelled = false;
     char text[33] = "Sending";
 
     auto transmit = [](Slot &slot) {
@@ -495,6 +518,7 @@ bool runRxUpdate(SDBulkLink &link, const char *path, char *result, size_t result
             if (keepalive(link, text, acked, rawSize, true) == SDBulk::CANCELLED)
             {
                 ok = false;
+                cancelled = true;
                 break;
             }
             lastShown = acked;
@@ -507,8 +531,10 @@ bool runRxUpdate(SDBulkLink &link, const char *path, char *result, size_t result
     f.h.type = FINISH;
     mbedtls_sha256_finish_ret(&sha, f.sha256);
     mbedtls_sha256_free(&sha);
+    if (cancelled)
+        return failRx(CANCEL_USER, "Cancelled");
     if (!ok)
-        return fail("Transfer failed");
+        return failRx(CANCEL_TRANSFER, "Transfer failed");
 
     // By now the queue is full of stale DATA_ACKs (the RX acks every duplicate too); a
     // full queue silently drops the FINISH_ACK, so start clean. The RX verifies the
@@ -523,10 +549,13 @@ bool runRxUpdate(SDBulkLink &link, const char *path, char *result, size_t result
         keepalive(link, "Verifying on RX", rawSize, rawSize);
     }
     if (!confirmed)
-        return fail("RX did not confirm");
+        return failRx(CANCEL_TRANSFER, "RX did not confirm");
     const auto fa = (const FinishAck *)r.data;
     char rxText[41] = {};
     memcpy(rxText, fa->text, 40);
+    // a failed FINISH leaves the RX in update mode: send it back to its old image
+    if (fa->status != ST_OK)
+        cancelRx(CANCEL_TRANSFER, rxText);
     stopEspNow();
 
     const char *file = strrchr(imagePath, '/');

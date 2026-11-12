@@ -63,6 +63,12 @@ static uint32_t rebootAt = 0;
 static uint32_t packets = 0, lastReport = 0;
 static bool finished = false;
 static FinishAck finishResult;
+static bool espNowUp = false;
+static uint8_t originalMac[6];
+static bool bootListening = false;
+static uint32_t bootListenEnd = 0;
+
+extern uint32_t LastValidPacket;
 
 // Update mode owns UART0 too (on some RXes those pins are PWM outputs): use it as a
 // plain log, it's the only window into this mode without a debug build
@@ -92,13 +98,47 @@ static void header(Header &h, Type t, uint8_t seq)
     h.seq = seq;
 }
 
-bool RxUpdateReceiver::enter()
+// Station on ESPNOW_CHANNEL with the MAC derived from the bind UID, so the TX can
+// address us without any discovery
+static void startEspNow()
 {
-    if (CRSF_to_BIT(ChannelData[4]))
-    {
-        DBGLN("RX update refused: armed");
-        return false;
-    }
+    if (espNowUp)
+        return;
+    // the TX keeps up to RxUpdate::WINDOW packets in flight; leave room for a burst
+    if (!rxQueue)
+        rxQueue = xQueueCreate(32, sizeof(Packet));
+    uint8_t mac[6];
+    macFromUid(UID, mac);
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    esp_wifi_get_mac(WIFI_IF_STA, originalMac);
+    esp_wifi_set_mac(WIFI_IF_STA, mac);
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous(false);
+    esp_now_init();
+    esp_wifi_config_espnow_rate(WIFI_IF_STA, ESPNOW_RATE);
+    esp_now_register_recv_cb(onRecv);
+    espNowUp = true;
+}
+
+// Back to how devWIFI left it: off, and with our own MAC should it start WiFi later
+static void stopEspNow()
+{
+    if (!espNowUp)
+        return;
+    esp_now_unregister_recv_cb();
+    esp_now_deinit();
+    esp_wifi_set_mac(WIFI_IF_STA, originalMac);
+    WiFi.mode(WIFI_OFF);
+    espNowUp = false;
+    havePeer = false;
+    xQueueReset(rxQueue);
+}
+
+static void enterUpdateMode()
+{
     DBGLN("Entering RX update mode");
     setConnectionState(rxUpdate);
     hwTimer::stop();
@@ -107,29 +147,65 @@ bool RxUpdateReceiver::enter()
     Serial.end();
     Serial.begin(115200, SERIAL_8N1, 3, 1);
 
-    // the TX keeps up to RxUpdate::WINDOW packets in flight; leave room for a burst
-    rxQueue = xQueueCreate(32, sizeof(Packet));
-    uint8_t mac[6];
-    macFromUid(UID, mac);
-    WiFi.persistent(false);
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-    const esp_err_t macErr = esp_wifi_set_mac(WIFI_IF_STA, mac);
-    esp_wifi_set_promiscuous(true);
-    const esp_err_t chErr = esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
-    esp_wifi_set_promiscuous(false);
-    const esp_err_t nowErr = esp_now_init();
-    esp_wifi_config_espnow_rate(WIFI_IF_STA, ESPNOW_RATE);
-    esp_now_register_recv_cb(onRecv);
+    startEspNow();
     uint8_t got[6];
     esp_wifi_get_mac(WIFI_IF_STA, got);
     uint8_t ch;
     wifi_second_chan_t ch2;
     esp_wifi_get_channel(&ch, &ch2);
-    RXU_LOG("enter: mac %02x:%02x:%02x:%02x:%02x:%02x (set %d) ch %u (set %d) espnow %d\n", got[0], got[1], got[2],
-            got[3], got[4], got[5], macErr, ch, chErr, nowErr);
+    RXU_LOG("enter: mac %02x:%02x:%02x:%02x:%02x:%02x ch %u\n", got[0], got[1], got[2], got[3], got[4], got[5], ch);
     lastPacket = millis();
+}
+
+bool RxUpdateReceiver::enter()
+{
+    if (CRSF_to_BIT(ChannelData[4]))
+    {
+        DBGLN("RX update refused: armed");
+        return false;
+    }
+    enterUpdateMode();
     return true;
+}
+
+void RxUpdateReceiver::bootListen()
+{
+    startEspNow();
+    bootListening = true;
+    bootListenEnd = millis() + BOOT_LISTEN_MS;
+}
+
+void RxUpdateReceiver::bootListenLoop(uint32_t now)
+{
+    if (!bootListening)
+        return;
+    // A TX is talking to us over the link: that wins, WiFi goes back off. (A TX
+    // looking for us over ESP-NOW has its radio off, so the two can't both happen.)
+    if (LastValidPacket != 0 || (int32_t)(now - bootListenEnd) > 0)
+    {
+        bootListening = false;
+        stopEspNow();
+        return;
+    }
+    // A HELLO for us: become the update receiver, loop() answers it. The TX repeats
+    // HELLO until it hears back, so only the newest one is worth keeping.
+    Packet p, hello;
+    bool found = false;
+    while (xQueueReceive(rxQueue, &p, 0) == pdTRUE)
+    {
+        if (((const Header *)p.data)->type == HELLO)
+        {
+            hello = p;
+            found = true;
+        }
+    }
+    if (found)
+    {
+        bootListening = false;
+        enterUpdateMode();
+        RXU_LOG("TX found us during boot\n");
+        xQueueSend(rxQueue, &hello, 0);
+    }
 }
 
 static void addPeer(const uint8_t *mac)
@@ -209,6 +285,7 @@ static void handle(const Packet &p)
         strncpy(a.commit, commit, sizeof(a.commit));
         const esp_partition_t *next = esp_ota_get_next_update_partition(nullptr);
         a.maxImage = next ? next->size - TRAILER_SIZE : 0;
+        a.proto = PROTO_VERSION;
         send(&a, sizeof(a));
         break;
     }
@@ -288,6 +365,28 @@ static void handle(const Packet &p)
         }
         header(finishResult.h, FINISH_ACK, h->seq);
         send(&finishResult, sizeof(finishResult));
+        break;
+    }
+
+    case CANCEL_UPDATE:
+    {
+        const auto c = (const Cancel *)p.data;
+        char why[sizeof(c->text) + 1] = {};
+        if (p.len > offsetof(Cancel, text))
+            memcpy(why, c->text, std::min<size_t>(sizeof(c->text), p.len - offsetof(Cancel, text)));
+        RXU_LOG("cancelled by TX (%u): %s\n", p.len > offsetof(Cancel, reason) ? c->reason : CANCEL_OTHER, why);
+        StatusOnly a;
+        header(a.h, CANCEL_UPDATE_ACK, h->seq);
+        a.status = ST_OK;
+        send(&a, sizeof(a));
+        // A finished update already points the bootloader at the new image and stays
+        // that way; anything less goes, and we come back on the image we have
+        if (started)
+            esp_ota_abort(ota);
+        started = false;
+        // a moment to answer a repeated CANCEL_UPDATE whose ACK got lost
+        if (!rebootAt)
+            rebootAt = millis() + 1000;
         break;
     }
     }

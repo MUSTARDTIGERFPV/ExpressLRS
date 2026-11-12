@@ -45,6 +45,7 @@ static uint32_t lastFinished = 0;
 static SDBulkLink *link = nullptr; // the job task's; outlives the task for statusText()
 static uint32_t prepareStart = 0;
 static bool rxCommandSent = false;
+static bool rxLinked = false;  // RX_UPDATE: told over the link, or waiting for it to boot
 
 
 static void sendSd(crsf_addr_e dest, uint8_t sub, const uint8_t *body, uint8_t len)
@@ -124,6 +125,19 @@ void handleCrsf(const crsf_ext_header_t *message)
     const uint8_t sub = message->payload[0];
     const uint8_t argLen = message->frame_size - 5;  // after the subtype
 
+    if (message->orig_addr == CRSF_ADDRESS_RADIO_TRANSMITTER && sub == SUB_REJECT && state == REQUESTING)
+    {
+        // the handset can't lend its card right now: [REJECT][kind][reason][text...]
+        char why[33] = {};
+        if (argLen > 2)
+            memcpy(why, &message->payload[3], std::min<size_t>(argLen - 2, sizeof(why) - 1));
+        state = IDLE;
+        snprintf(result, sizeof(result), "Radio: %s", why[0] ? why : "refused");
+        lastFinished = millis();
+        report(result);
+        return;
+    }
+
     if (message->orig_addr != CRSF_ADDRESS_RADIO_TRANSMITTER)
     {
         // USB (or anything else that isn't the handset) asking us to start one:
@@ -139,7 +153,10 @@ void handleCrsf(const crsf_ext_header_t *message)
         return;
     }
 
-    if (sub == SUB_OFFER && (state == IDLE || state == REQUESTING))
+    // Only an offer we asked for. A late one (the handset busy past our timeout, its
+    // UART DMA still holding our requests) would otherwise start a session nobody
+    // is waiting for; ignored, the handset's offer just times out.
+    if (sub == SUB_OFFER && state == REQUESTING)
     {
         // [OFFER][kind][proto][max payload u16]
         if (isArmed)
@@ -152,24 +169,13 @@ void handleCrsf(const crsf_ext_header_t *message)
             report("offer rejected: armed");
             return;
         }
-        // an offer the handset started itself carries the kind; one we asked for echoes ours
-        if (state == IDLE)
-            jobPath[0] = '\0';
         kind = message->payload[1];
-        if (kind == KIND_RX_UPDATE)
+        // A linked RX has to hear about it while the link is still up: once we accept,
+        // the handset stops the mixer and we stop RF. One we can't reach over the link
+        // (off, or on another major version) listens for us for a moment after it boots.
+        rxLinked = kind == KIND_RX_UPDATE && connectionState == connected;
+        if (rxLinked)
         {
-            // The RX has to hear about it while the link is still up: once we accept,
-            // the handset stops the mixer and we stop RF
-            if (connectionState != connected)
-            {
-                const uint8_t body[] = {kind, 2, 'N', 'o', ' ', 'r', 'e', 'c', 'e', 'i', 'v', 'e', 'r'};
-                sendSd(CRSF_ADDRESS_RADIO_TRANSMITTER, SUB_REJECT, body, sizeof(body));
-                state = IDLE;
-                snprintf(result, sizeof(result), "No receiver connected");
-                lastFinished = millis();
-                report("offer rejected: no receiver");
-                return;
-            }
             prepareStart = millis();
             rxCommandSent = false;
             state = PREPARING_RX;
@@ -190,7 +196,7 @@ void loop(uint32_t now)
         if ((int32_t)(now - requestStart) > (int32_t)REQUEST_TIMEOUT_MS)
         {
             state = IDLE;
-            snprintf(result, sizeof(result), "No answer from radio");
+            snprintf(result, sizeof(result), "No answer - needs EdgeTX with SD support");
             lastFinished = now;
             report("no offer from handset");
         }
@@ -222,10 +228,13 @@ void loop(uint32_t now)
         }
         if (state == PREPARING_RX && (int32_t)(now - prepareStart) > 2000)
         {
-            const uint8_t body[] = {kind, 3, 'R', 'X', ' ', 'n', 'o', ' ', 'a', 'c', 'k'};
+            // Linked but deaf to the command: firmware from before RX updates
+            static const char why[] = "RX firmware too old?";
+            uint8_t body[2 + sizeof(why) - 1] = {kind, 3};
+            memcpy(&body[2], why, sizeof(why) - 1);
             sendSd(CRSF_ADDRESS_RADIO_TRANSMITTER, SUB_REJECT, body, sizeof(body));
             state = IDLE;
-            snprintf(result, sizeof(result), "Receiver did not respond");
+            snprintf(result, sizeof(result), "Receiver didn't respond - firmware too old?");
             lastFinished = now;
             report("RX did not ack the update command");
         }
@@ -264,7 +273,7 @@ static bool runJob(SDBulkLink &link)
     int st = link.hello(&freeKb, &rtc);
     if (st != SDBulk::OK)
     {
-        snprintf(result, sizeof(result), "HELLO failed (%d)", st);
+        snprintf(result, sizeof(result), "Radio didn't answer (%d)", st);
         return false;
     }
 
@@ -357,7 +366,7 @@ static void jobTask(void *)
     if (kind == KIND_TEST)
         runJob(*link);
     else if (kind == KIND_RX_UPDATE)
-        runRxUpdate(*link, jobPath[0] ? jobPath : nullptr, result, sizeof(result));
+        runRxUpdate(*link, jobPath[0] ? jobPath : nullptr, rxLinked, result, sizeof(result));
     else if (kind == KIND_IMAGE_SYNC)
         runImageSync(*link, jobPath[0] ? jobPath : nullptr, result, sizeof(result));
     else

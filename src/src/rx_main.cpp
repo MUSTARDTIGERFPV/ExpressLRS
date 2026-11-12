@@ -2098,6 +2098,12 @@ void setup()
 
     devicesStart();
 
+#if defined(PLATFORM_ESP32) || defined(PLATFORM_ESP8266)
+    // a TX may be waiting to update us, with no way to reach us over the link
+    if (connectionState == disconnected)
+        RxUpdateReceiver::bootListen();
+#endif
+
     // setup() eats up some of this time, which can cause the first mode connection to fail.
     // Resetting the time here give the first mode a better chance of connection.
     RFmodeLastCycled = millis();
@@ -2127,6 +2133,7 @@ void loop()
     executeDeferredFunction(micros());
 
 #if defined(PLATFORM_ESP32) || defined(PLATFORM_ESP8266)
+    RxUpdateReceiver::bootListenLoop(now);
     if (connectionState == rxUpdate)
     {
         RxUpdateReceiver::loop(now);
