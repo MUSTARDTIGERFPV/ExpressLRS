@@ -7,9 +7,9 @@
 //    running sketch and eboot copies it over on reboot, so the image has to fit in
 //    ~430 KB: the RX asks for the .bin.gz as-is (FLAG_WANTS_GZIP) and eboot inflates it.
 //  * Our own options/hardware trailer can't be appended (it would have to be inside the
-//    gzip stream), so it's carried across in LittleFS instead: /options.json,
-//    /hardware.json (marked "_carried") and /product.json, which options.cpp and
-//    hardware.cpp fall back to when the new image boots without a trailer.
+//    gzip stream), so the image ends in an erased one and ours waits in LittleFS
+//    (/trailer.bin) for the new firmware to write back on its first boot. After that
+//    the RX is exactly as a web update would have left it.
 
 #include "RxUpdateReceiver.h"
 #include "RxUpdateProto.h"
@@ -23,7 +23,6 @@
 #include "logging.h"
 #include "options.h"
 
-#include <ArduinoJson.h>
 #include <ESP8266WiFi.h>
 #include <LittleFS.h>
 #include <Updater.h>
@@ -36,9 +35,6 @@ extern "C" {
 using namespace RxUpdate;
 
 static constexpr uint32_t IDLE_REBOOT_MS = 30000;
-static constexpr size_t OPTIONS_OFFSET = ELRSOPTS_PRODUCTNAME_SIZE + ELRSOPTS_DEVICENAME_SIZE;
-static constexpr size_t HARDWARE_OFFSET = OPTIONS_OFFSET + ELRSOPTS_OPTIONS_SIZE;
-static constexpr size_t TRAILER_SIZE = HARDWARE_OFFSET + ELRSOPTS_HARDWARE_SIZE;
 
 #if defined(RADIO_SX128X)
 #define KEY_RADIO "2400"
@@ -138,53 +134,28 @@ static void addPeer(const uint8_t *mac)
     havePeer = true;
 }
 
-// One NUL-terminated JSON field of the running image's trailer, or "" if it has none
-static String trailerField(size_t offset, size_t maxLen)
+// The new image arrives with an erased trailer: leave a copy of ours in LittleFS for it to
+// write back on first boot (options_init). Whatever the user changed in the web UI
+// (/options.json, /hardware.json) stays where it is, exactly as with a web update.
+static bool stashTrailer()
 {
-    static uint32_t buf[ELRSOPTS_HARDWARE_SIZE / 4];
-    if (ESP.flashRead(ESP.getSketchSize() + offset, buf, maxLen) == false)
-        return String();
-    const char *s = (const char *)buf;
-    if (buf[0] == 0xFFFFFFFF)
-        return String();
-    return String(s).substring(0, strnlen(s, maxLen));
-}
-
-// The new image boots without a trailer; leave what it needs in LittleFS
-static bool carryConfig()
-{
-    // product/lua name: from RAM, so it survives any number of OTA generations
+    uint32_t buf[64];
+    bool blank = true;
+    File f = LittleFS.open(ELRSOPTS_TRAILER_STASH, "w");
+    if (!f)
+        return false;
+    for (size_t off = 0; off < ELRSOPTS_TRAILER_SIZE; off += sizeof(buf))
     {
-        JsonDocument doc;
-        doc["product_name"] = (const char *)product_name;
-        doc["lua_name"] = (const char *)device_name;
-        File f = LittleFS.open("/product.json", "w");
-        if (!f || serializeJson(doc, f) == 0)
+        const size_t n = std::min(sizeof(buf), ELRSOPTS_TRAILER_SIZE - off);
+        if (!ESP.flashRead(ESP.getSketchSize() + off, buf, n) || f.write((uint8_t *)buf, n) != n)
             return false;
+        for (size_t i = 0; i < n / 4; i++)
+            blank &= buf[i] == 0xFFFFFFFF;
     }
-
-    // options: the trailer's if this image has one; otherwise /options.json is already
-    // what we're running on, so it stays
-    const String options = trailerField(OPTIONS_OFFSET, ELRSOPTS_OPTIONS_SIZE);
-    if (options.length())
-    {
-        File f = LittleFS.open("/options.json", "w");
-        if (!f || f.print(options) != options.length())
-            return false;
-    }
-
-    // hardware: carried copies are marked, so a layout flashed later over UART wins
-    const String hardware = trailerField(HARDWARE_OFFSET, ELRSOPTS_HARDWARE_SIZE);
-    if (hardware.length())
-    {
-        JsonDocument doc;
-        if (deserializeJson(doc, hardware) != DeserializationError::Ok)
-            return false;
-        doc["_carried"] = true;
-        File f = LittleFS.open("/hardware.json", "w");
-        if (!f || serializeJson(doc, f) == 0)
-            return false;
-    }
+    f.close();
+    // nothing to carry (a bare image): don't make the new one write 0xFF over 0xFF
+    if (blank)
+        LittleFS.remove(ELRSOPTS_TRAILER_STASH);
     return true;
 }
 
@@ -204,7 +175,7 @@ static uint8_t finish(const Finish *f, char *text, size_t textLen)
         snprintf(text, textLen, "hash mismatch");
         return ST_BAD_HASH;
     }
-    if (!carryConfig())
+    if (!stashTrailer())
     {
         // no end(): on the ESP8266 that would schedule eboot to copy this image
         started = false;
