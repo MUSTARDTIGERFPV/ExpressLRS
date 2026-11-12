@@ -59,6 +59,11 @@ static uint32_t expected = 0, imageSize = 0;
 static bool started = false;
 static mbedtls_sha256_context sha;
 static uint32_t rebootAt = 0;
+static uint32_t packets = 0, lastReport = 0;
+
+// Update mode owns UART0 too (on some RXes those pins are PWM outputs): use it as a
+// plain log, it's the only window into this mode without a debug build
+#define RXU_LOG(...) Serial.printf("RXU " __VA_ARGS__)
 
 static void onRecv(const uint8_t *mac, const uint8_t *data, int len)
 {
@@ -96,18 +101,28 @@ bool RxUpdateReceiver::enter()
     hwTimer::stop();
     Radio.End();
 
+    Serial.end();
+    Serial.begin(115200, SERIAL_8N1, 3, 1);
+
     rxQueue = xQueueCreate(8, sizeof(Packet));
     uint8_t mac[6];
     macFromUid(UID, mac);
     WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
-    esp_wifi_set_mac(WIFI_IF_STA, mac);
+    const esp_err_t macErr = esp_wifi_set_mac(WIFI_IF_STA, mac);
     esp_wifi_set_promiscuous(true);
-    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    const esp_err_t chErr = esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
     esp_wifi_set_promiscuous(false);
-    esp_now_init();
+    const esp_err_t nowErr = esp_now_init();
     esp_now_register_recv_cb(onRecv);
+    uint8_t got[6];
+    esp_wifi_get_mac(WIFI_IF_STA, got);
+    uint8_t ch;
+    wifi_second_chan_t ch2;
+    esp_wifi_get_channel(&ch, &ch2);
+    RXU_LOG("enter: mac %02x:%02x:%02x:%02x:%02x:%02x (set %d) ch %u (set %d) espnow %d\n", got[0], got[1], got[2],
+            got[3], got[4], got[5], macErr, ch, chErr, nowErr);
     lastPacket = millis();
     return true;
 }
@@ -264,9 +279,17 @@ void RxUpdateReceiver::loop(uint32_t now)
     while (xQueueReceive(rxQueue, &p, 0) == pdTRUE)
     {
         lastPacket = now;
+        packets++;
         handle(p);
     }
-    if ((rebootAt && (int32_t)(now - rebootAt) > 0) || now - lastPacket > IDLE_REBOOT_MS)
+    if ((int32_t)(now - lastReport) >= 1000)
+    {
+        lastReport = now;
+        RXU_LOG("alive: %u packets, expected %u/%u\n", packets, expected, imageSize);
+    }
+    // signed: `now` is sampled before enter() runs from the deferred queue, so it can
+    // be a few ms older than lastPacket on the first pass
+    if ((rebootAt && (int32_t)(now - rebootAt) > 0) || (int32_t)(now - lastPacket) > (int32_t)IDLE_REBOOT_MS)
     {
         if (started)
             Update.abort();

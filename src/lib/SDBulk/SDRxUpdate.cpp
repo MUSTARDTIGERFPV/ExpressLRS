@@ -25,6 +25,15 @@ static constexpr uint32_t KEEPALIVE_MS = 800;
 static constexpr uint32_t FIND_RX_TIMEOUT_MS = 10000;
 
 static QueueHandle_t ackQueue;
+static volatile uint32_t sendOk = 0, sendFail = 0;
+
+static void onSent(const uint8_t *, esp_now_send_status_t status)
+{
+    if (status == ESP_NOW_SEND_SUCCESS)
+        sendOk++;
+    else
+        sendFail++;
+}
 static uint8_t rxMac[6];
 static uint8_t seq;
 static uint32_t lastCall;
@@ -90,6 +99,8 @@ static bool startEspNow()
     if (esp_now_init() != ESP_OK)
         return false;
     esp_now_register_recv_cb(onRecv);
+    esp_now_register_send_cb(onSent);
+    sendOk = sendFail = 0;
     esp_now_peer_info_t info = {};
     memcpy(info.peer_addr, rxMac, 6);
     info.channel = ESPNOW_CHANNEL;
@@ -292,7 +303,12 @@ bool runRxUpdate(SDBulkLink &link, const char *path, char *result, size_t result
             return fail("Cancelled");
     }
     if (!found)
-        return fail("Receiver did not answer");
+    {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Receiver did not answer (%02x:%02x tx ok %u fail %u)", rxMac[4], rxMac[5],
+                 (unsigned)sendOk, (unsigned)sendFail);
+        return fail(msg);
+    }
     info.key[sizeof(info.key) - 1] = info.version[sizeof(info.version) - 1] = '\0';
     char rxCommit[9] = {};
     memcpy(rxCommit, info.commit, 8);
