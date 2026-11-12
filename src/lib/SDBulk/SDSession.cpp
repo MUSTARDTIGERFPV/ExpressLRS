@@ -100,8 +100,11 @@ const char *statusText()
 {
     switch (state)
     {
-    case REQUESTING: return "Asking radio...";
-    case PREPARING_RX: return "Telling receiver...";
+    // asking the handset and telling the RX take a few hundred ms, then the handset's
+    // session screen covers the Lua; one label for all of it, so the line left on the
+    // Lua when the session screen closes isn't a stale "asking..."
+    case REQUESTING:
+    case PREPARING_RX:
     case ACCEPTING:
     case ACTIVE:
     case FINISHED: return "Running...";
