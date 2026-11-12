@@ -282,8 +282,9 @@ static void handle(const Packet &p)
             finishResult = {};
             finishResult.status = finish((const Finish *)p.data, finishResult.text, sizeof(finishResult.text));
             finished = finishResult.status == ST_OK;
+            // stay up long enough to answer a FINISH whose answer got lost
             if (finished)
-                rebootAt = millis() + 500;
+                rebootAt = millis() + 5000;
         }
         header(finishResult.h, FINISH_ACK, h->seq);
         send(&finishResult, sizeof(finishResult));

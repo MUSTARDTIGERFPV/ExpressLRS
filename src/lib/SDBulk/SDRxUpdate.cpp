@@ -358,6 +358,7 @@ bool runRxUpdate(SDBulkLink &link, const char *path, char *result, size_t result
     b.h.type = BEGIN;
     b.size = rawSize;
     bool begun = false;
+    xQueueReset(ackQueue);
     keepalive(link, "Erasing on RX", 0, rawSize, true);
     for (int t = 0; t < 40 && !begun; t++)
     {
@@ -503,9 +504,19 @@ bool runRxUpdate(SDBulkLink &link, const char *path, char *result, size_t result
     if (!ok)
         return fail("Transfer failed");
 
+    // By now the queue is full of stale DATA_ACKs (the RX acks every duplicate too); a
+    // full queue silently drops the FINISH_ACK, so start clean. The RX verifies the
+    // whole image (~1-2 s) before it answers, then keeps answering repeats for a few
+    // seconds before it reboots: ask often, and keep the handset's session alive.
+    xQueueReset(ackQueue);
     keepalive(link, "Verifying on RX", rawSize, rawSize, true);
-    // the RX verifies the whole image before it answers
-    if (!exchange(&f, sizeof(f), FINISH_ACK, r, 4000, 3))
+    bool confirmed = false;
+    for (int t = 0; t < 12 && !confirmed; t++)
+    {
+        confirmed = exchange(&f, sizeof(f), FINISH_ACK, r, 1000, 1);
+        keepalive(link, "Verifying on RX", rawSize, rawSize);
+    }
+    if (!confirmed)
         return fail("RX did not confirm");
     const auto fa = (const FinishAck *)r.data;
     char rxText[41] = {};
