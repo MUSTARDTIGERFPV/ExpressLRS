@@ -401,7 +401,14 @@ bool runRxUpdate(SDBulkLink &link, const char *path, bool linked, char *result, 
     else if (!pickImage(link, key, wantsGzip, imagePath, sizeof(imagePath)))
     {
         char msg[48];
-        snprintf(msg, sizeof(msg), "No %.18s image on SD - sync first", key);
+        // A sync only brings this TX's own regulatory build, so syncing won't help
+        // a receiver of the other one. Never fall back to it: that would quietly
+        // change the receiver's domain.
+        if (info.domain != buildDomain())
+            snprintf(msg, sizeof(msg), "%s receiver - this TX only syncs %s",
+                     info.domain == DOMAIN_LBT ? "LBT" : "FCC", buildDomain() == DOMAIN_LBT ? "LBT" : "FCC");
+        else
+            snprintf(msg, sizeof(msg), "No %.18s image on SD - sync first", key);
         return failRx(CANCEL_NO_IMAGE, msg);
     }
 

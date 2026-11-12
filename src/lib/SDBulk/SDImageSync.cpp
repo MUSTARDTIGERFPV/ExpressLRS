@@ -5,6 +5,7 @@
 #include <Arduino.h>
 #include "logging.h"
 #include "options.h"
+#include "RxUpdateProto.h"
 
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
@@ -333,6 +334,12 @@ bool runImageSync(SDBulkLink &link, const char *manifestUrl, char *result, size_
             failed++;
             continue;
         }
+        // only this TX's own regulatory build: an FCC TX has no business carrying
+        // EU (LBT) images, and the other way around
+        const size_t kl = strlen(key);
+        const bool lbtImage = kl > 4 && strcmp(key + kl - 4, "-lbt") == 0;
+        if (lbtImage != (RxUpdate::buildDomain() == RxUpdate::DOMAIN_LBT))
+            continue;
         const String imageUrl = strncmp(file, "http", 4) == 0 ? String(file) : base + file;
         switch (fetchImage(link, imageUrl, key, version, size, sha, bytes))
         {
