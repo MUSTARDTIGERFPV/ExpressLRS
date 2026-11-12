@@ -1,0 +1,277 @@
+#if defined(TARGET_RX) && defined(PLATFORM_ESP32)
+
+#include "RxUpdateReceiver.h"
+#include "RxUpdateProto.h"
+
+#include <Arduino.h>
+#include "targets.h"
+#include "device.h"
+#include "common.h"
+#include "OTA.h"
+#include "hwTimer.h"
+#include "logging.h"
+#include "options.h"
+
+#include <Update.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_ota_ops.h>
+#include <esp_partition.h>
+#include <esp_wifi.h>
+#include <mbedtls/sha256.h>
+
+using namespace RxUpdate;
+
+// The TX gives up well before this; it's only so a dead session doesn't strand the RX
+static constexpr uint32_t IDLE_REBOOT_MS = 30000;
+static constexpr size_t TRAILER_SIZE =
+    ELRSOPTS_PRODUCTNAME_SIZE + ELRSOPTS_DEVICENAME_SIZE + ELRSOPTS_OPTIONS_SIZE + ELRSOPTS_HARDWARE_SIZE;
+
+#if defined(PLATFORM_ESP32_S3)
+#define KEY_PLATFORM "esp32s3"
+#elif defined(PLATFORM_ESP32_C3)
+#define KEY_PLATFORM "esp32c3"
+#else
+#define KEY_PLATFORM "esp32"
+#endif
+#if defined(RADIO_SX128X)
+#define KEY_RADIO "2400"
+#elif defined(RADIO_LR1121)
+#define KEY_RADIO "lr1121"
+#elif defined(RADIO_LR2021)
+#define KEY_RADIO "lr2021"
+#else
+#define KEY_RADIO "900"
+#endif
+
+struct Packet
+{
+    uint8_t mac[6];
+    uint8_t len;
+    uint8_t data[250];
+};
+
+static QueueHandle_t rxQueue;
+static uint8_t peer[6];
+static bool havePeer = false;
+static uint32_t lastPacket = 0;
+static uint32_t expected = 0, imageSize = 0;
+static bool started = false;
+static mbedtls_sha256_context sha;
+static uint32_t rebootAt = 0;
+
+static void onRecv(const uint8_t *mac, const uint8_t *data, int len)
+{
+    if (!valid(data, len) || len > 250)
+        return;
+    Packet p;
+    memcpy(p.mac, mac, 6);
+    p.len = len;
+    memcpy(p.data, data, len);
+    xQueueSend(rxQueue, &p, 0);
+}
+
+static void send(const void *pkt, size_t len)
+{
+    esp_now_send(peer, (const uint8_t *)pkt, len);
+}
+
+static void header(Header &h, Type t, uint8_t seq)
+{
+    h.magic[0] = MAGIC0;
+    h.magic[1] = MAGIC1;
+    h.type = t;
+    h.seq = seq;
+}
+
+bool RxUpdateReceiver::enter()
+{
+    if (CRSF_to_BIT(ChannelData[4]))
+    {
+        DBGLN("RX update refused: armed");
+        return false;
+    }
+    DBGLN("Entering RX update mode");
+    setConnectionState(rxUpdate);
+    hwTimer::stop();
+    Radio.End();
+
+    rxQueue = xQueueCreate(8, sizeof(Packet));
+    uint8_t mac[6];
+    macFromUid(UID, mac);
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    esp_wifi_set_mac(WIFI_IF_STA, mac);
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous(false);
+    esp_now_init();
+    esp_now_register_recv_cb(onRecv);
+    lastPacket = millis();
+    return true;
+}
+
+static void addPeer(const uint8_t *mac)
+{
+    if (havePeer && memcmp(peer, mac, 6) == 0)
+        return;
+    if (havePeer)
+        esp_now_del_peer(peer);
+    memcpy(peer, mac, 6);
+    esp_now_peer_info_t info = {};
+    memcpy(info.peer_addr, mac, 6);
+    info.channel = ESPNOW_CHANNEL;
+    info.ifidx = WIFI_IF_STA;
+    esp_now_add_peer(&info);
+    havePeer = true;
+}
+
+static uint8_t finish(const Finish *f, char *text, size_t textLen)
+{
+    if (!started || expected != imageSize)
+    {
+        snprintf(text, textLen, "short image %u/%u", expected, imageSize);
+        return ST_NOT_STARTED;
+    }
+    uint8_t digest[32];
+    mbedtls_sha256_finish_ret(&sha, digest);
+    mbedtls_sha256_free(&sha);
+    if (memcmp(digest, f->sha256, 32) != 0)
+    {
+        Update.abort();
+        started = false;
+        snprintf(text, textLen, "hash mismatch");
+        return ST_BAD_HASH;
+    }
+
+    // Carry our own trailer (product name, options, hardware layout) across, so the
+    // new image boots with this RX's layout and bind phrase
+    static uint8_t trailer[TRAILER_SIZE];
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (esp_partition_read(running, ESP.getSketchSize(), trailer, TRAILER_SIZE) != ESP_OK ||
+        Update.write(trailer, TRAILER_SIZE) != TRAILER_SIZE)
+    {
+        Update.abort();
+        started = false;
+        snprintf(text, textLen, "trailer copy failed");
+        return ST_WRITE_FAILED;
+    }
+    if (!Update.end(true))
+    {
+        started = false;
+        snprintf(text, textLen, "verify failed (%u)", Update.getError());
+        return ST_WRITE_FAILED;
+    }
+    started = false;
+    snprintf(text, textLen, "ok, rebooting");
+    return ST_OK;
+}
+
+static void handle(const Packet &p)
+{
+    const auto h = (const Header *)p.data;
+    addPeer(p.mac);
+
+    switch (h->type)
+    {
+    case HELLO:
+    {
+        HelloAck a = {};
+        header(a.h, HELLO_ACK, h->seq);
+        strncpy(a.key, KEY_PLATFORM "-" KEY_RADIO, sizeof(a.key));
+        strncpy(a.version, version, sizeof(a.version));
+        strncpy(a.commit, commit, sizeof(a.commit));
+        const esp_partition_t *next = esp_ota_get_next_update_partition(nullptr);
+        a.maxImage = next ? next->size - TRAILER_SIZE : 0;
+        send(&a, sizeof(a));
+        break;
+    }
+
+    case BEGIN:
+    {
+        const auto b = (const Begin *)p.data;
+        StatusOnly a;
+        header(a.h, BEGIN_ACK, h->seq);
+        if (started)
+        {
+            // a retried BEGIN after we already started: same answer
+            a.status = imageSize == b->size ? ST_OK : ST_WRITE_FAILED;
+        }
+        else if (!Update.begin(b->size + TRAILER_SIZE))
+        {
+            a.status = ST_TOO_BIG;
+        }
+        else
+        {
+            started = true;
+            imageSize = b->size;
+            expected = 0;
+            mbedtls_sha256_init(&sha);
+            mbedtls_sha256_starts_ret(&sha, 0);
+            a.status = ST_OK;
+        }
+        send(&a, sizeof(a));
+        break;
+    }
+
+    case DATA:
+    {
+        const auto d = (const Data *)p.data;
+        const int n = p.len - (int)offsetof(Data, data);
+        DataAck a;
+        header(a.h, DATA_ACK, h->seq);
+        a.status = ST_OK;
+        if (!started)
+        {
+            a.status = ST_NOT_STARTED;
+        }
+        else if (d->offset == expected && n > 0 && expected + n <= imageSize)
+        {
+            // only ever in order: a duplicate (lost ACK) or a gap gets the same
+            // "next expected" answer and the TX resends from there
+            if (Update.write((uint8_t *)d->data, n) != (size_t)n)
+            {
+                a.status = ST_WRITE_FAILED;
+            }
+            else
+            {
+                mbedtls_sha256_update_ret(&sha, d->data, n);
+                expected += n;
+            }
+        }
+        a.next = expected;
+        send(&a, sizeof(a));
+        break;
+    }
+
+    case FINISH:
+    {
+        FinishAck a = {};
+        header(a.h, FINISH_ACK, h->seq);
+        a.status = finish((const Finish *)p.data, a.text, sizeof(a.text));
+        send(&a, sizeof(a));
+        if (a.status == ST_OK)
+            rebootAt = millis() + 500;
+        break;
+    }
+    }
+}
+
+void RxUpdateReceiver::loop(uint32_t now)
+{
+    Packet p;
+    while (xQueueReceive(rxQueue, &p, 0) == pdTRUE)
+    {
+        lastPacket = now;
+        handle(p);
+    }
+    if ((rebootAt && (int32_t)(now - rebootAt) > 0) || now - lastPacket > IDLE_REBOOT_MS)
+    {
+        if (started)
+            Update.abort();
+        ESP.restart();
+    }
+}
+
+#endif

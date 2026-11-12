@@ -956,6 +956,18 @@ static void SendRxWiFiOverMSP()
   DataUlSender.SetDataToTransmit(MSPDataPackage, 1);
 }
 
+// SDSession: tell the RX to stop and wait for firmware over ESP-NOW
+void sdSessionSendRxEnterUpdate()
+{
+  MSPDataPackage[0] = MSP_ELRS_ENTER_RX_UPDATE;
+  DataUlSender.SetDataToTransmit(MSPDataPackage, 1);
+}
+
+bool sdSessionLinkCommandPending()
+{
+  return DataUlSender.IsActive();
+}
+
 static void CheckReadyToSend()
 {
   if (RxWiFiReadyToSend)

@@ -37,6 +37,7 @@
 #include "devServoOutput.h"
 #include "devWIFI.h"
 #include "RXEndpoint.h"
+#include "RxUpdateReceiver.h"
 #include "RXOTAConnector.h"
 #include "rx-serial/devSerialIO.h"
 
@@ -1251,6 +1252,14 @@ void DataUlReceiveComplete()
             setWifiUpdateMode();
         });
         break;
+#if defined(PLATFORM_ESP32)
+    case MSP_ELRS_ENTER_RX_UPDATE: // 0x12
+        // same as wifi: let the ACK go out first
+        deferExecutionMillis(500, []() {
+            RxUpdateReceiver::enter();
+        });
+        break;
+#endif
     case MSP_ELRS_MAVLINK_TLM: // 0xFD
         // raw mavlink data
         if (config.GetSerialProtocol() == PROTOCOL_MAVLINK)
@@ -2116,6 +2125,14 @@ void loop()
 
     CheckConfigChangePending();
     executeDeferredFunction(micros());
+
+#if defined(PLATFORM_ESP32)
+    if (connectionState == rxUpdate)
+    {
+        RxUpdateReceiver::loop(now);
+        return;
+    }
+#endif
 
     if (connectionState > MODE_STATES)
     {

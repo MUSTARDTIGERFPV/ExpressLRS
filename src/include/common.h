@@ -49,6 +49,7 @@ typedef enum
     wifiUpdate,
     serialUpdate,
     sdBulk,           // TX only: the handset port is running the SD bulk protocol
+    rxUpdate,         // RX only: link stopped, receiving firmware from the TX over ESP-NOW
     // Failure states go below here to display immediately
     FAILURE_STATES,
     radioFailed,
