@@ -32,6 +32,7 @@ enum Kind : uint8_t
 {
     KIND_RX_UPDATE = 0x01,
     KIND_IMAGE_SYNC = 0x02,
+    KIND_TEST = 0x7F,       // bench: read a file, hash it, log the hash
 };
 
 void setTransport(SDBulkTransport *transport);
