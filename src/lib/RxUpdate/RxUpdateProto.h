@@ -2,17 +2,18 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <esp_wifi_types.h>
 
 // TX -> RX firmware transfer over ESP-NOW, after the RX was told over the RC link
 // (MSP_ELRS_ENTER_RX_UPDATE) to stop the radio and listen.
 //
 // The RX takes a station MAC derived from the binding UID, so the TX knows where to
 // send without any discovery, and only a TX with the same bind phrase can reach it.
-// Strict stop-and-wait: every TX packet gets an answer, the TX retries on silence.
+// Every TX packet gets an answer; HELLO/BEGIN/FINISH are stop-and-wait, DATA is windowed.
 //
 //   TX  HELLO        ->  RX  HELLO_ACK   (image key, version, commit, max image size)
 //   TX  BEGIN(size)  ->  RX  BEGIN_ACK
-//   TX  DATA(off)    ->  RX  DATA_ACK(next expected offset)   ... repeated
+//   TX  DATA(off)    ->  RX  DATA_ACK(next expected offset)   ... up to WINDOW in flight
 //   TX  FINISH(sha)  ->  RX  FINISH_ACK(status, text), then the RX reboots into it
 //
 // The image is the bare firmware (no options/hardware trailer); the RX appends its
@@ -23,6 +24,11 @@ namespace RxUpdate
 constexpr uint8_t ESPNOW_CHANNEL = 1;
 constexpr uint8_t MAGIC0 = 'E', MAGIC1 = 'U';
 constexpr uint16_t DATA_MAX = 232;
+// packets the TX keeps in flight; the RX acks cumulatively ("next offset I expect")
+// and only ever writes in order, so a gap means go-back-N from the oldest unacked
+constexpr uint8_t WINDOW = 8;
+// the default 1 Mbps caps a 232 B packet stream at ~80 KB/s before acks
+constexpr wifi_phy_rate_t ESPNOW_RATE = WIFI_PHY_RATE_12M;
 
 enum Type : uint8_t
 {

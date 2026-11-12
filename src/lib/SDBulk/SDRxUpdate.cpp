@@ -54,6 +54,21 @@ static void onRecv(const uint8_t *mac, const uint8_t *data, int len)
     xQueueSend(ackQueue, &r, 0);
 }
 
+// esp_now_send() only queues; with a window in flight its buffer can be full for a moment
+static bool sendRaw(const void *pkt, size_t len)
+{
+    for (int t = 0; t < 50; t++)
+    {
+        const esp_err_t err = esp_now_send(rxMac, (const uint8_t *)pkt, len);
+        if (err == ESP_OK)
+            return true;
+        if (err != ESP_ERR_ESPNOW_NO_MEM)
+            return false;
+        vTaskDelay(1);
+    }
+    return false;
+}
+
 static int keepalive(SDBulkLink &link, const char *text, uint32_t done = 0, uint32_t total = 0, bool force = false)
 {
     if (!force && millis() - lastCall < KEEPALIVE_MS)
@@ -88,7 +103,7 @@ static bool exchange(void *pkt, size_t len, Type want, Reply &out, uint32_t time
 
 static bool startEspNow()
 {
-    ackQueue = xQueueCreate(8, sizeof(Reply));
+    ackQueue = xQueueCreate(32, sizeof(Reply));
     macFromUid(UID, rxMac);
     WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
@@ -98,6 +113,7 @@ static bool startEspNow()
     esp_wifi_set_promiscuous(false);
     if (esp_now_init() != ESP_OK)
         return false;
+    esp_wifi_config_espnow_rate(WIFI_IF_STA, ESPNOW_RATE);
     esp_now_register_recv_cb(onRecv);
     esp_now_register_send_cb(onSent);
     sendOk = sendFail = 0;
@@ -336,10 +352,24 @@ bool runRxUpdate(SDBulkLink &link, const char *path, char *result, size_t result
         return fail("Image too big for RX");
     }
 
+    // The RX erases the whole target range before it answers (~1-2 s per MB); the
+    // retried BEGINs queue up behind it and get the same answer
     Begin b = {};
     b.h.type = BEGIN;
     b.size = rawSize;
-    if (!exchange(&b, sizeof(b), BEGIN_ACK, r, 500, 10) || ((StatusOnly *)r.data)->status != ST_OK)
+    bool begun = false;
+    keepalive(link, "Erasing on RX", 0, rawSize, true);
+    for (int t = 0; t < 40 && !begun; t++)
+    {
+        if (exchange(&b, sizeof(b), BEGIN_ACK, r, 500, 1))
+        {
+            if (((StatusOnly *)r.data)->status != ST_OK)
+                break;
+            begun = true;
+        }
+        keepalive(link, "Erasing on RX", 0, rawSize);
+    }
+    if (!begun)
     {
         src->close();
         return fail("RX refused the image");
@@ -349,65 +379,118 @@ bool runRxUpdate(SDBulkLink &link, const char *path, char *result, size_t result
     mbedtls_sha256_init(&sha);
     mbedtls_sha256_starts_ret(&sha, 0);
 
-    static Data d;
-    d.h.type = DATA;
-    uint32_t sent = 0, lastShown = 0, retries = 0;
+    // Sliding window, go-back-N. Packets stay in `win` until the RX's cumulative ack
+    // passes them, since the inflated stream can't be rewound.
+    struct Slot
+    {
+        uint16_t len;
+        Data d;
+    };
+    static Slot win[WINDOW];
+    uint8_t tail = 0, count = 0;
+    uint32_t sent = 0, acked = 0, lastShown = 0, retries = 0, stalls = 0;
+    bool eof = false;
     const uint32_t ts = millis();
     bool ok = true;
     char text[33] = "Sending";
-    while (sent < rawSize)
+
+    auto transmit = [](Slot &slot) {
+        slot.d.h.magic[0] = MAGIC0;
+        slot.d.h.magic[1] = MAGIC1;
+        slot.d.h.type = DATA;
+        slot.d.h.seq = ++seq;
+        return sendRaw(&slot.d, offsetof(Data, data) + slot.len);
+    };
+
+    while (ok && (acked < rawSize))
     {
-        // fill one packet from the (possibly inflated) stream
-        int n = 0;
-        while (n < (int)DATA_MAX)
+        // top the window up from the (possibly inflated) stream
+        while (!eof && count < WINDOW && sent < rawSize)
         {
-            const int got = src->read(d.data + n, DATA_MAX - n);
-            if (got <= 0)
-                break;
-            n += got;
-        }
-        if (n <= 0)
-        {
-            ok = false;
-            break;
-        }
-        mbedtls_sha256_update_ret(&sha, d.data, n);
-        d.offset = sent;
-
-        // the RX stalls on flash erases; give it room before calling it lost
-        bool acked = false;
-        for (int t = 0; t < 30 && !acked; t++)
-        {
-            if (t)
-                retries++;
-            if (exchange(&d, offsetof(Data, data) + n, DATA_ACK, r, 120, 1))
+            Slot &slot = win[(tail + count) % WINDOW];
+            int n = 0;
+            while (n < (int)DATA_MAX)
             {
-                const auto a = (const DataAck *)r.data;
-                if (a->status != ST_OK)
+                const int got = src->read(slot.d.data + n, DATA_MAX - n);
+                if (got < 0)
+                {
+                    ok = false;
                     break;
-                acked = a->next == sent + n;
+                }
+                if (got == 0)
+                {
+                    eof = true;
+                    break;
+                }
+                n += got;
             }
-            // our own reads/progress are the radio's keepalive; a long stall needs one
-            if (millis() - lastCall > KEEPALIVE_MS)
-                keepalive(link, text, sent, rawSize, true);
+            if (!ok || n == 0)
+                break;
+            mbedtls_sha256_update_ret(&sha, slot.d.data, n);
+            slot.len = n;
+            slot.d.offset = sent;
+            sent += n;
+            count++;
+            if (!transmit(slot))
+                ok = false;
         }
-        if (!acked)
-        {
-            ok = false;
+        if (!ok || count == 0)
             break;
-        }
-        sent += n;
-        lastCall = millis(); // every SD read above counts as traffic for the handset
 
-        if (sent - lastShown >= 16384 || sent == rawSize)
+        // collect acks; any progress slides the window
+        const uint32_t before = acked;
+        const uint32_t waitStart = millis();
+        while (acked == before && millis() - waitStart < 60)
         {
-            snprintf(text, sizeof(text), "Sending %u/%u KB", sent / 1024, rawSize / 1024);
-            if (keepalive(link, text, sent, rawSize, true) == SDBulk::CANCELLED)
+            if (xQueueReceive(ackQueue, &r, pdMS_TO_TICKS(2)) != pdTRUE)
+                continue;
+            const auto h = (const Header *)r.data;
+            if (h->type != DATA_ACK)
+                continue;
+            const auto a = (const DataAck *)r.data;
+            if (a->status != ST_OK)
             {
                 ok = false;
                 break;
             }
-            lastShown = sent;
+            if (a->next > acked)
+                acked = a->next;
+        }
+        while (count && win[tail].d.offset + win[tail].len <= acked)
+        {
+            tail = (tail + 1) % WINDOW;
+            count--;
+        }
+
+        if (acked == before && ok)
+        {
+            // nothing moved: resend everything still in flight, oldest first
+            if (++stalls > 100)
+            {
+                ok = false;
+                break;
+            }
+            for (uint8_t i = 0; i < count; i++)
+            {
+                retries++;
+                transmit(win[(tail + i) % WINDOW]);
+            }
+        }
+        else
+        {
+            stalls = 0;
+        }
+
+        lastCall = millis(); // the SD reads above are the handset's keepalive
+        if (acked - lastShown >= 16384 || acked == rawSize || millis() - lastCall > KEEPALIVE_MS)
+        {
+            snprintf(text, sizeof(text), "Sending %u/%u KB", acked / 1024, rawSize / 1024);
+            if (keepalive(link, text, acked, rawSize, true) == SDBulk::CANCELLED)
+            {
+                ok = false;
+                break;
+            }
+            lastShown = acked;
         }
     }
     src->close();
@@ -421,7 +504,8 @@ bool runRxUpdate(SDBulkLink &link, const char *path, char *result, size_t result
         return fail("Transfer failed");
 
     keepalive(link, "Verifying on RX", rawSize, rawSize, true);
-    if (!exchange(&f, sizeof(f), FINISH_ACK, r, 1500, 4))
+    // the RX verifies the whole image before it answers
+    if (!exchange(&f, sizeof(f), FINISH_ACK, r, 4000, 3))
         return fail("RX did not confirm");
     const auto fa = (const FinishAck *)r.data;
     char rxText[41] = {};

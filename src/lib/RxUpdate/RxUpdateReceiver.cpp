@@ -12,7 +12,6 @@
 #include "logging.h"
 #include "options.h"
 
-#include <Update.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_ota_ops.h>
@@ -57,9 +56,13 @@ static bool havePeer = false;
 static uint32_t lastPacket = 0;
 static uint32_t expected = 0, imageSize = 0;
 static bool started = false;
+static esp_ota_handle_t ota = 0;
+static const esp_partition_t *target = nullptr;
 static mbedtls_sha256_context sha;
 static uint32_t rebootAt = 0;
 static uint32_t packets = 0, lastReport = 0;
+static bool finished = false;
+static FinishAck finishResult;
 
 // Update mode owns UART0 too (on some RXes those pins are PWM outputs): use it as a
 // plain log, it's the only window into this mode without a debug build
@@ -104,7 +107,8 @@ bool RxUpdateReceiver::enter()
     Serial.end();
     Serial.begin(115200, SERIAL_8N1, 3, 1);
 
-    rxQueue = xQueueCreate(8, sizeof(Packet));
+    // the TX keeps up to RxUpdate::WINDOW packets in flight; leave room for a burst
+    rxQueue = xQueueCreate(32, sizeof(Packet));
     uint8_t mac[6];
     macFromUid(UID, mac);
     WiFi.persistent(false);
@@ -115,6 +119,7 @@ bool RxUpdateReceiver::enter()
     const esp_err_t chErr = esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
     esp_wifi_set_promiscuous(false);
     const esp_err_t nowErr = esp_now_init();
+    esp_wifi_config_espnow_rate(WIFI_IF_STA, ESPNOW_RATE);
     esp_now_register_recv_cb(onRecv);
     uint8_t got[6];
     esp_wifi_get_mac(WIFI_IF_STA, got);
@@ -154,7 +159,7 @@ static uint8_t finish(const Finish *f, char *text, size_t textLen)
     mbedtls_sha256_free(&sha);
     if (memcmp(digest, f->sha256, 32) != 0)
     {
-        Update.abort();
+        esp_ota_abort(ota);
         started = false;
         snprintf(text, textLen, "hash mismatch");
         return ST_BAD_HASH;
@@ -165,17 +170,22 @@ static uint8_t finish(const Finish *f, char *text, size_t textLen)
     static uint8_t trailer[TRAILER_SIZE];
     const esp_partition_t *running = esp_ota_get_running_partition();
     if (esp_partition_read(running, ESP.getSketchSize(), trailer, TRAILER_SIZE) != ESP_OK ||
-        Update.write(trailer, TRAILER_SIZE) != TRAILER_SIZE)
+        esp_ota_write(ota, trailer, TRAILER_SIZE) != ESP_OK)
     {
-        Update.abort();
+        esp_ota_abort(ota);
         started = false;
         snprintf(text, textLen, "trailer copy failed");
         return ST_WRITE_FAILED;
     }
-    if (!Update.end(true))
+    // esp_ota_end() verifies the image (segments + appended SHA-256) before we point the
+    // bootloader at it
+    esp_err_t err = esp_ota_end(ota);
+    if (err == ESP_OK)
+        err = esp_ota_set_boot_partition(target);
+    if (err != ESP_OK)
     {
         started = false;
-        snprintf(text, textLen, "verify failed (%u)", Update.getError());
+        snprintf(text, textLen, "verify failed (%d)", err);
         return ST_WRITE_FAILED;
     }
     started = false;
@@ -213,7 +223,10 @@ static void handle(const Packet &p)
             // a retried BEGIN after we already started: same answer
             a.status = imageSize == b->size ? ST_OK : ST_WRITE_FAILED;
         }
-        else if (!Update.begin(b->size + TRAILER_SIZE))
+        // esp_ota_begin() erases the whole range now (a couple of seconds) so the
+        // stream itself never stalls on a sector erase; the TX waits it out
+        else if (!(target = esp_ota_get_next_update_partition(nullptr)) || b->size + TRAILER_SIZE > target->size ||
+                 esp_ota_begin(target, b->size + TRAILER_SIZE, &ota) != ESP_OK)
         {
             a.status = ST_TOO_BIG;
         }
@@ -245,7 +258,7 @@ static void handle(const Packet &p)
         {
             // only ever in order: a duplicate (lost ACK) or a gap gets the same
             // "next expected" answer and the TX resends from there
-            if (Update.write((uint8_t *)d->data, n) != (size_t)n)
+            if (esp_ota_write(ota, d->data, n) != ESP_OK)
             {
                 a.status = ST_WRITE_FAILED;
             }
@@ -262,12 +275,18 @@ static void handle(const Packet &p)
 
     case FINISH:
     {
-        FinishAck a = {};
-        header(a.h, FINISH_ACK, h->seq);
-        a.status = finish((const Finish *)p.data, a.text, sizeof(a.text));
-        send(&a, sizeof(a));
-        if (a.status == ST_OK)
-            rebootAt = millis() + 500;
+        // esp_ota_end() reads the whole image back to verify it, which can outlast the
+        // TX's patience; a retried FINISH must get the same answer, not "not started"
+        if (!finished)
+        {
+            finishResult = {};
+            finishResult.status = finish((const Finish *)p.data, finishResult.text, sizeof(finishResult.text));
+            finished = finishResult.status == ST_OK;
+            if (finished)
+                rebootAt = millis() + 500;
+        }
+        header(finishResult.h, FINISH_ACK, h->seq);
+        send(&finishResult, sizeof(finishResult));
         break;
     }
     }
@@ -292,7 +311,7 @@ void RxUpdateReceiver::loop(uint32_t now)
     if ((rebootAt && (int32_t)(now - rebootAt) > 0) || (int32_t)(now - lastPacket) > (int32_t)IDLE_REBOOT_MS)
     {
         if (started)
-            Update.abort();
+            esp_ota_abort(ota);
         ESP.restart();
     }
 }
