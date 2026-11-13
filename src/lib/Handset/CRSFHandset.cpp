@@ -76,6 +76,9 @@ void CRSFHandset::Begin()
         duplex_set_RX();
     }
     portENABLE_INTERRUPTS();
+    // Arduino's default interrupts at 120 of the 128 FIFO bytes, ~21us of slack at
+    // 3.75 Mbaud: with WiFi busy that drops bytes from long (SD bulk) frames
+    Port.setRxFIFOFull(32);
     flush_port_input();
     SDSession::setTransport(this);
 #elif defined(PLATFORM_ESP8266)
