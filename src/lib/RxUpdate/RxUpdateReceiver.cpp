@@ -55,6 +55,16 @@ static uint8_t peer[6];
 static bool havePeer = false;
 static uint32_t lastPacket = 0;
 static uint32_t expected = 0, imageSize = 0;
+// esp_ota_write() per 232 B packet ran ~1.2 ms each (a flash program per call, most of
+// them straddling two pages) and capped the transfer at ~190 KB/s. Whole pages are
+// cheaper per byte, but not too many at once: a 4 KB write keeps the cache off for
+// ~13 ms, long enough for the radio to drop frames
+static uint8_t wbuf[1024];
+static uint16_t wLen = 0;
+// a DATA_ACK held back (ACK_EVERY), and when it's due
+static uint8_t unacked = 0;
+static DataAck pendingAck;
+static uint32_t ackDue = 0;
 static bool started = false;
 static esp_ota_handle_t ota = 0;
 static const esp_partition_t *target = nullptr;
@@ -118,7 +128,7 @@ static void startEspNow()
     esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
     esp_wifi_set_promiscuous(false);
     esp_now_init();
-    esp_wifi_config_espnow_rate(WIFI_IF_STA, ESPNOW_RATE);
+    esp_wifi_config_espnow_rate(WIFI_IF_STA, ACK_RATE);
     esp_now_register_recv_cb(onRecv);
     espNowUp = true;
 }
@@ -223,6 +233,33 @@ static void addPeer(const uint8_t *mac)
     havePeer = true;
 }
 
+// Buffer in-order image bytes, writing whole wbufs to flash
+static bool writeImage(const uint8_t *data, size_t n)
+{
+    while (n)
+    {
+        const size_t take = std::min(n, sizeof(wbuf) - wLen);
+        memcpy(&wbuf[wLen], data, take);
+        wLen += take;
+        data += take;
+        n -= take;
+        if (wLen == sizeof(wbuf))
+        {
+            wLen = 0;
+            if (esp_ota_write(ota, wbuf, sizeof(wbuf)) != ESP_OK)
+                return false;
+        }
+    }
+    return true;
+}
+
+static bool flushImage()
+{
+    const uint16_t n = wLen;
+    wLen = 0;
+    return !n || esp_ota_write(ota, wbuf, n) == ESP_OK;
+}
+
 static uint8_t finish(const Finish *f, char *text, size_t textLen)
 {
     if (!started || expected != imageSize)
@@ -245,7 +282,7 @@ static uint8_t finish(const Finish *f, char *text, size_t textLen)
     // new image boots with this RX's layout and bind phrase
     static uint8_t trailer[TRAILER_SIZE];
     const esp_partition_t *running = esp_ota_get_running_partition();
-    if (esp_partition_read(running, ESP.getSketchSize(), trailer, TRAILER_SIZE) != ESP_OK ||
+    if (!flushImage() || esp_partition_read(running, ESP.getSketchSize(), trailer, TRAILER_SIZE) != ESP_OK ||
         esp_ota_write(ota, trailer, TRAILER_SIZE) != ESP_OK)
     {
         esp_ota_abort(ota);
@@ -313,6 +350,8 @@ static void handle(const Packet &p)
             started = true;
             imageSize = b->size;
             expected = 0;
+            unacked = 0;
+            wLen = 0;
             mbedtls_sha256_init(&sha);
             mbedtls_sha256_starts_ret(&sha, 0);
             a.status = ST_OK;
@@ -336,7 +375,7 @@ static void handle(const Packet &p)
         {
             // only ever in order: a duplicate (lost ACK) or a gap gets the same
             // "next expected" answer and the TX resends from there
-            if (esp_ota_write(ota, d->data, n) != ESP_OK)
+            if (!writeImage(d->data, n))
             {
                 a.status = ST_WRITE_FAILED;
             }
@@ -347,6 +386,17 @@ static void handle(const Packet &p)
             }
         }
         a.next = expected;
+        // An ack at ACK_RATE costs more air than the DATA it answers, so in-order
+        // progress is acked every ACK_EVERY packets, or ACK_DELAY_US after the last
+        // one. Anything else (a gap, a duplicate, an error, the last byte) right away:
+        // the TX goes back on a repeated ack.
+        if (a.status == ST_OK && d->offset + n == expected && expected < imageSize && ++unacked < ACK_EVERY)
+        {
+            pendingAck = a;
+            ackDue = micros() + ACK_DELAY_US;
+            break;
+        }
+        unacked = 0;
         send(&a, sizeof(a));
         break;
     }
@@ -401,6 +451,11 @@ void RxUpdateReceiver::loop(uint32_t now)
         lastPacket = now;
         packets++;
         handle(p);
+    }
+    if (unacked && (int32_t)(micros() - ackDue) >= 0)
+    {
+        unacked = 0;
+        send(&pendingAck, sizeof(pendingAck));
     }
     if ((int32_t)(now - lastReport) >= 2000)
     {

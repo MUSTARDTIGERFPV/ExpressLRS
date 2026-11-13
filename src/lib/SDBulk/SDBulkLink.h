@@ -37,6 +37,7 @@ enum Op : uint8_t
 
 enum Status : int
 {
+    PENDING = -2, // poll(): the answer isn't in yet
     NO_ANSWER = -1,
     OK = 0,
     END_OF_FILE = 1,
@@ -65,10 +66,21 @@ class SDBulkLink
 public:
     explicit SDBulkLink(SDBulkTransport *transport) : transport(transport) {}
 
+    static constexpr uint32_t READ_TIMEOUT_MS = 50;
+
     // Sends a request and waits for its answer, retrying with the same seq. Returns the
     // status byte, or NO_ANSWER. The answer's payload (after the status) lands in resp.
     int call(uint8_t op, const uint8_t *body, uint16_t len, uint8_t *resp = nullptr,
              uint16_t *respLen = nullptr, uint32_t timeoutMs = 250, int tries = 8);
+
+    // call() in two halves, for a caller with other work to do meanwhile: start()
+    // sends the request, poll() returns PENDING until the answer is in (resending on
+    // timeout as call() does), then its status. Nothing else may use the link while a
+    // request is pending: the line is half-duplex and answers are matched by seq.
+    void start(uint8_t op, const uint8_t *body, uint16_t len, uint8_t *resp, uint16_t *respLen,
+               uint32_t timeoutMs, int tries);
+    int poll();
+    void readStart(uint8_t handle, uint32_t offset, uint8_t *data, uint16_t want, uint16_t *got);
 
     int hello(uint32_t *freeKb = nullptr, uint32_t *rtc = nullptr);
     int stat(const char *path, uint32_t *size, bool *isDir);
@@ -94,10 +106,20 @@ public:
 
 private:
     bool parse(uint8_t c);
+    void sendFrame();
 
     SDBulkTransport *transport;
     uint8_t seq = 0;
     uint8_t tx[SDBulk::MAX_PAYLOAD + 16];
     uint8_t rx[SDBulk::MAX_PAYLOAD + 16];
     uint16_t rxLen = 0;
+
+    // the request in flight
+    int pendStatus = SDBulk::OK;
+    uint16_t txLen = 0;
+    uint8_t *pResp = nullptr;
+    uint16_t *pRespLen = nullptr;
+    uint32_t pTimeout = 0, pStart = 0;
+    int pTriesLeft = 0;
+    int lastGot = 0;
 };

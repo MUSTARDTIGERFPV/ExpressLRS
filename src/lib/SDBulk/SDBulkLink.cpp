@@ -39,11 +39,14 @@ bool SDBulkLink::parse(uint8_t c)
     return (rx[3 + flen] | (rx[4 + flen] << 8)) == crc16(&rx[3], flen);
 }
 
-int SDBulkLink::call(uint8_t op, const uint8_t *body, uint16_t len, uint8_t *resp, uint16_t *respLen,
-                     uint32_t timeoutMs, int tries)
+void SDBulkLink::start(uint8_t op, const uint8_t *body, uint16_t len, uint8_t *resp, uint16_t *respLen,
+                       uint32_t timeoutMs, int tries)
 {
     if (len > maxPayload)
-        return SDBulk::BAD_REQUEST;
+    {
+        pendStatus = SDBulk::BAD_REQUEST;
+        return;
+    }
 
     const uint16_t flen = len + 2;
     tx[0] = SYNC;
@@ -55,44 +58,77 @@ int SDBulkLink::call(uint8_t op, const uint8_t *body, uint16_t len, uint8_t *res
     const uint16_t c = crc16(&tx[3], flen);
     tx[3 + flen] = c;
     tx[4 + flen] = c >> 8;
+    txLen = 5 + flen;
 
     calls++;
-    for (int t = 0; t < tries; t++)
-    {
-        if (t)
-            retries++;
-        rxLen = 0;
-        transport->bulkSend(tx, 5 + flen);
+    pResp = resp;
+    pRespLen = respLen;
+    pTimeout = timeoutMs;
+    pTriesLeft = tries;
+    pendStatus = SDBulk::PENDING;
+    sendFrame();
+}
 
-        const uint32_t start = millis();
-        while (millis() - start < timeoutMs)
+void SDBulkLink::sendFrame()
+{
+    pTriesLeft--;
+    rxLen = 0;
+    transport->bulkSend(tx, txLen);
+    pStart = millis();
+}
+
+int SDBulkLink::poll()
+{
+    if (pendStatus != SDBulk::PENDING)
+        return pendStatus;
+
+    uint8_t buf[128];
+    lastGot = transport->bulkRead(buf, sizeof(buf));
+    for (int i = 0; i < lastGot; i++)
+    {
+        if (parse(buf[i]) && rx[3] == (tx[3] | RESPONSE) && rx[4] == seq)
         {
-            uint8_t buf[128];
-            const int got = transport->bulkRead(buf, sizeof(buf));
-            for (int i = 0; i < got; i++)
-            {
-                if (parse(buf[i]) && rx[3] == (op | RESPONSE) && rx[4] == seq)
-                {
-                    const uint16_t n = (rx[1] | (rx[2] << 8)) - 3;
-                    if (resp)
-                        memcpy(resp, &rx[6], n);
-                    if (respLen)
-                        *respLen = n;
-                    seq++;
-                    return rx[5];
-                }
-            }
-            // never sleep mid-frame: a 512 B answer outruns a 1 ms tick at 3.75 Mbaud
-            if (got <= 0)
-            {
-                if (rxLen)
-                    taskYIELD();
-                else
-                    vTaskDelay(1);
-            }
+            const uint16_t n = (rx[1] | (rx[2] << 8)) - 3;
+            if (pResp)
+                memcpy(pResp, &rx[6], n);
+            if (pRespLen)
+                *pRespLen = n;
+            seq++;
+            pendStatus = rx[5];
+            return pendStatus;
         }
     }
-    return SDBulk::NO_ANSWER;
+    if (millis() - pStart >= pTimeout)
+    {
+        if (pTriesLeft <= 0)
+        {
+            pendStatus = SDBulk::NO_ANSWER;
+            return pendStatus;
+        }
+        retries++;
+        sendFrame();
+    }
+    return SDBulk::PENDING;
+}
+
+int SDBulkLink::call(uint8_t op, const uint8_t *body, uint16_t len, uint8_t *resp, uint16_t *respLen,
+                     uint32_t timeoutMs, int tries)
+{
+    start(op, body, len, resp, respLen, timeoutMs, tries);
+    for (;;)
+    {
+        const int st = poll();
+        if (st != SDBulk::PENDING)
+            return st;
+        // never sleep mid-frame: a 512 B answer outruns a 1 ms tick at 3.75 Mbaud
+        if (lastGot <= 0)
+        {
+            if (rxLen)
+                taskYIELD();
+            else
+                vTaskDelay(1);
+        }
+    }
 }
 
 int SDBulkLink::hello(uint32_t *freeKb, uint32_t *rtc)
@@ -157,7 +193,18 @@ int SDBulkLink::read(uint8_t handle, uint32_t offset, uint8_t *data, uint16_t wa
     memcpy(&b[1], &offset, 4);
     memcpy(&b[5], &want, 2);
     *got = 0;
-    return call(SDBulk::READ, b, sizeof(b), data, got);
+    // a read answers in ~3 ms; when a frame is lost (it happens while ESP-NOW is busy)
+    // waiting out the full default timeout cost more than the rest of the transfer
+    return call(SDBulk::READ, b, sizeof(b), data, got, READ_TIMEOUT_MS, 20);
+}
+
+void SDBulkLink::readStart(uint8_t handle, uint32_t offset, uint8_t *data, uint16_t want, uint16_t *got)
+{
+    uint8_t b[7] = {handle};
+    memcpy(&b[1], &offset, 4);
+    memcpy(&b[5], &want, 2);
+    *got = 0;
+    start(SDBulk::READ, b, sizeof(b), data, got, READ_TIMEOUT_MS, 20);
 }
 
 int SDBulkLink::write(uint8_t handle, uint32_t offset, const uint8_t *data, uint16_t len)

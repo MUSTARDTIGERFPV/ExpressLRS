@@ -13,11 +13,12 @@
 //
 // The RX takes a station MAC derived from the binding UID, so the TX knows where to
 // send without any discovery, and only a TX with the same bind phrase can reach it.
-// Every TX packet gets an answer; HELLO/BEGIN/FINISH are stop-and-wait, DATA is windowed.
+// HELLO/BEGIN/FINISH are stop-and-wait. DATA is windowed and acked cumulatively, though
+// not every DATA gets its own answer (see ACK_EVERY).
 //
 //   TX  HELLO        ->  RX  HELLO_ACK   (image key, version, commit, max image size)
 //   TX  BEGIN(size)  ->  RX  BEGIN_ACK
-//   TX  DATA(off)    ->  RX  DATA_ACK(next expected offset)   ... up to WINDOW in flight
+//   TX  DATA(off)    ->  RX  DATA_ACK(next expected offset)   ... a window in flight
 //   TX  FINISH(sha)  ->  RX  FINISH_ACK(status, text), then the RX reboots into it
 //   TX  CANCEL_UPDATE(why)  ->  RX  CANCEL_UPDATE_ACK, then the RX reboots into what it has
 //
@@ -39,12 +40,24 @@ constexpr uint8_t ESPNOW_CHANNEL = 1;
 constexpr uint32_t BOOT_LISTEN_MS = 1500;
 constexpr uint8_t MAGIC0 = 'E', MAGIC1 = 'U';
 constexpr uint16_t DATA_MAX = 232;
-// packets the TX keeps in flight; the RX acks cumulatively ("next offset I expect")
-// and only ever writes in order, so a gap means go-back-N from the oldest unacked
+// Packets the TX keeps in flight for any RX. The RX acks cumulatively ("next offset I
+// expect") and only ever writes in order, so a gap means go-back-N from the oldest
+// unacked. An ESP32 RX queues 32 packets, so its TX may keep more in flight; the
+// ESP8285 holds 12.
 constexpr uint8_t WINDOW = 8;
+// An ESP32 RX acks in-order progress every ACK_EVERY packets, or ACK_DELAY_US after
+// the last one, and anything else (a gap, a duplicate, an error, the last byte) at
+// once. So a repeat of the current ack means a packet went missing, and the TX goes
+// back then rather than at its timeout. A TX keeping fewer than ACK_EVERY packets in
+// flight still works, one ACK_DELAY_US per window slower.
+constexpr uint8_t ACK_EVERY = 8;
+constexpr uint32_t ACK_DELAY_US = 2000;
 #if defined(PLATFORM_ESP32)
-// the default 1 Mbps caps a 232 B packet stream at ~80 KB/s before acks
+// DATA: the default 1 Mbps caps a 232 B packet stream at ~80 KB/s before acks
 constexpr wifi_phy_rate_t ESPNOW_RATE = WIFI_PHY_RATE_12M;
+// the RX's answers: short, so the most robust rate costs little. At 12 Mbps up to 1
+// in 8 acks failed to arrive on the bench, and each loss stalled the transfer.
+constexpr wifi_phy_rate_t ACK_RATE = WIFI_PHY_RATE_1M_L;
 #endif
 
 // HelloAck.flags

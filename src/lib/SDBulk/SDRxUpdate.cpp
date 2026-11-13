@@ -23,11 +23,14 @@
 using namespace RxUpdate;
 
 static constexpr uint32_t KEEPALIVE_MS = 800;
+static constexpr uint32_t PROGRESS_MS = 500;
 static constexpr uint32_t FIND_RX_TIMEOUT_MS = 10000;
 // how long to wait for someone to power the receiver on
 static constexpr uint32_t FIND_BOOTING_RX_TIMEOUT_MS = 30000;
 
 static QueueHandle_t ackQueue;
+// the transfer loop sleeps until an ESP-NOW callback has news
+static TaskHandle_t waiter;
 static volatile uint32_t sendOk = 0, sendFail = 0;
 
 static void onSent(const uint8_t *, esp_now_send_status_t status)
@@ -36,6 +39,8 @@ static void onSent(const uint8_t *, esp_now_send_status_t status)
         sendOk++;
     else
         sendFail++;
+    if (waiter)
+        xTaskNotifyGive(waiter);
 }
 static uint8_t rxMac[6];
 static uint8_t seq;
@@ -55,21 +60,26 @@ static void onRecv(const uint8_t *mac, const uint8_t *data, int len)
     r.len = len;
     memcpy(r.data, data, len);
     xQueueSend(ackQueue, &r, 0);
+    if (waiter)
+        xTaskNotifyGive(waiter);
 }
 
-// esp_now_send() only queues; with a window in flight its buffer can be full for a moment
-static bool sendRaw(const void *pkt, size_t len)
+// esp_now_send() only queues; with a window in flight its buffer can be full for a
+// moment. 1 = queued, 0 = full (only when !wait), -1 = failed
+static int sendRaw(const void *pkt, size_t len, bool wait = true)
 {
     for (int t = 0; t < 50; t++)
     {
         const esp_err_t err = esp_now_send(rxMac, (const uint8_t *)pkt, len);
         if (err == ESP_OK)
-            return true;
+            return 1;
         if (err != ESP_ERR_ESPNOW_NO_MEM)
-            return false;
+            return -1;
+        if (!wait)
+            return 0;
         vTaskDelay(1);
     }
-    return false;
+    return -1;
 }
 
 static int keepalive(SDBulkLink &link, const char *text, uint32_t done = 0, uint32_t total = 0, bool force = false)
@@ -227,6 +237,8 @@ static bool pickImage(SDBulkLink &link, const char *key, bool gzOnly, char *path
 }
 
 // Streams file bytes in, raw firmware bytes out. Handles .bin.gz with the ROM inflater.
+// One card read is kept in flight ahead of what's being consumed: pump() moves it
+// along without blocking, so the caller can keep the air busy meanwhile.
 class ImageSource
 {
 public:
@@ -239,6 +251,9 @@ public:
         if (link->open(path, SDBulk::OPEN_READ, &h, &fileSize) != SDBulk::OK)
             return false;
         fileOff = inPos = inLen = 0;
+        in = buf[0];
+        next = buf[1];
+        nextState = NEXT_EMPTY;
         if (!gz)
         {
             rawSize = fileSize;
@@ -265,6 +280,8 @@ public:
         tinfl_init(&inflator);
         dictOfs = outPos = outLen = 0;
         done = false;
+        // the caller talks to the handset before the transfer starts
+        settle();
         return true;
     }
 
@@ -273,14 +290,17 @@ public:
     {
         if (!gz)
         {
-            if (fileOff >= fileSize)
-                return 0;
-            uint16_t got = 0;
-            const uint16_t want = std::min<uint32_t>(std::min<size_t>(max, link->chunkSize()), fileSize - fileOff);
-            if (link->read(h, fileOff, out, want, &got) != SDBulk::OK)
-                return -1;
-            fileOff += got;
-            return got;
+            if (inPos == inLen)
+            {
+                if (fileOff >= fileSize)
+                    return 0;
+                if (!fill())
+                    return -1;
+            }
+            const size_t n = std::min(max, inLen - inPos);
+            memcpy(out, &in[inPos], n);
+            inPos += n;
+            return n;
         }
         while (outPos == outLen)
         {
@@ -307,26 +327,93 @@ public:
         return n;
     }
 
-    void close() { link->close(h); }
+    // Whether read() can most likely produce a whole DATA packet without waiting for
+    // the card. "Most likely" because a gzip block can't be sized in advance; a wrong
+    // guess only means read() waits for the read in flight.
+    bool ready() const
+    {
+        if (nextState != NEXT_PENDING || fileOff >= fileSize)
+            return true;
+        if (gz)
+            return done || outLen - outPos >= DATA_MAX || inLen - inPos >= DATA_MAX;
+        return inLen - inPos >= DATA_MAX;
+    }
+
+    // Move the read in flight along, and start the next one; never blocks. Whoever
+    // else uses the link must settle() first.
+    void pump()
+    {
+        if (nextState == NEXT_PENDING)
+        {
+            const int st = link->poll();
+            if (st == SDBulk::PENDING)
+                return;
+            nextState = st == SDBulk::OK && nextLen ? NEXT_FULL : NEXT_FAILED;
+        }
+        if (nextState == NEXT_EMPTY && fileOff < fileSize)
+        {
+            link->readStart(h, fileOff, next, link->chunkSize(), &nextLen);
+            nextState = NEXT_PENDING;
+        }
+    }
+
+    bool busy() const { return nextState == NEXT_PENDING; }
+
+    // finish the read in flight, so the link is free for something else
+    void settle()
+    {
+        while (nextState == NEXT_PENDING)
+        {
+            pump();
+            taskYIELD();
+        }
+    }
+
+    void close()
+    {
+        settle();
+        link->close(h);
+    }
 
 private:
+    // swap in the read-ahead buffer, waiting for it if it's still on its way
     bool fill()
     {
-        uint16_t got = 0;
-        if (link->read(h, fileOff, in, link->chunkSize(), &got) != SDBulk::OK || !got)
+        pump();
+        while (nextState == NEXT_PENDING)
+        {
+            taskYIELD();
+            pump();
+        }
+        if (nextState != NEXT_FULL)
             return false;
-        fileOff += got;
+        std::swap(in, next);
         inPos = 0;
-        inLen = got;
+        inLen = nextLen;
+        fileOff += nextLen;
+        nextState = NEXT_EMPTY;
+        pump();
         return true;
     }
+
+    enum NextState : uint8_t
+    {
+        NEXT_EMPTY,
+        NEXT_PENDING,
+        NEXT_FULL,
+        NEXT_FAILED,
+    };
 
     SDBulkLink *link = nullptr;
     uint8_t h = 0;
     bool gz = false, done = false;
+    // fileOff is where `in`'s bytes end; `next` holds (or will hold) the ones after
     uint32_t fileSize = 0, fileOff = 0;
-    uint8_t in[SDBulk::MAX_PAYLOAD];
+    uint8_t buf[2][SDBulk::MAX_PAYLOAD];
+    uint8_t *in = buf[0], *next = buf[1];
     size_t inPos = 0, inLen = 0;
+    uint16_t nextLen = 0;
+    NextState nextState = NEXT_EMPTY;
     tinfl_decompressor inflator;
     uint8_t dict[TINFL_LZ_DICT_SIZE];
     size_t dictOfs = 0, outPos = 0, outLen = 0;
@@ -455,36 +542,108 @@ bool runRxUpdate(SDBulkLink &link, const char *path, bool linked, char *result, 
     mbedtls_sha256_init(&sha);
     mbedtls_sha256_starts_ret(&sha, 0);
 
-    // Sliding window, go-back-N. Packets stay in `win` until the RX's cumulative ack
-    // passes them, since the inflated stream can't be rewound.
+    // Sliding window, go-back-N. Packets stay in `ring` until the RX's cumulative ack
+    // passes them, since the inflated stream can't be rewound. Up to PREFETCH more are
+    // made ready ahead of the window, and the card read behind them is in flight while
+    // the loop keeps the air busy: each card read is a CRSF round trip to the handset.
     struct Slot
     {
         uint16_t len;
         Data d;
     };
-    static Slot win[WINDOW];
-    uint8_t tail = 0, count = 0;
-    uint32_t sent = 0, acked = 0, lastShown = 0, retries = 0, stalls = 0;
+    // An ESP32 RX queues 32 packets; the 8285 (the one that wants gzip) holds 12, so
+    // it gets the protocol's WINDOW
+    static constexpr uint8_t BIG_WINDOW = 24;
+    static constexpr uint8_t PREFETCH = 8;
+    static constexpr uint8_t RING = BIG_WINDOW + PREFETCH;
+    const uint8_t window = wantsGzip ? WINDOW : BIG_WINDOW;
+    static Slot ring[RING];
+    uint8_t tail = 0, inflight = 0, ready = 0;
+    uint32_t sent = 0, acked = 0, retries = 0, stalls = 0;
     bool eof = false;
     const uint32_t ts = millis();
+    sendOk = sendFail = 0;
     bool ok = true;
     bool cancelled = false;
     char text[33] = "Sending";
+    uint32_t lastProgress = millis();
+    // fast retransmit: the RX acks a gap at once, so a repeat of the current ack means
+    // a packet went missing; go back right away, once per hole, not at the stall timeout
+    uint32_t fastResentAt = UINT32_MAX;
+    bool resendNow = false;
 
-    auto transmit = [](Slot &slot) {
+    auto transmit = [](Slot &slot, bool wait) {
         slot.d.h.magic[0] = MAGIC0;
         slot.d.h.magic[1] = MAGIC1;
         slot.d.h.type = DATA;
         slot.d.h.seq = ++seq;
-        return sendRaw(&slot.d, offsetof(Data, data) + slot.len);
+        return sendRaw(&slot.d, offsetof(Data, data) + slot.len, wait);
+    };
+    auto onAck = [&](const Reply &r) {
+        const auto h = (const Header *)r.data;
+        if (h->type != DATA_ACK)
+            return;
+        const auto a = (const DataAck *)r.data;
+        if (a->status != ST_OK)
+        {
+            ok = false;
+            return;
+        }
+        if (a->next == acked && inflight && fastResentAt != acked)
+        {
+            fastResentAt = acked;
+            resendNow = true;
+        }
+        if (a->next <= acked)
+            return;
+        acked = a->next;
+        lastProgress = millis();
+        stalls = 0;
     };
 
-    while (ok && (acked < rawSize))
+    waiter = xTaskGetCurrentTaskHandle();
+    while (ok && acked < rawSize)
     {
-        // top the window up from the (possibly inflated) stream
-        while (!eof && count < WINDOW && sent < rawSize)
+        src->pump();
+        // take every ack that's waiting, and free what they cover
+        while (ok && xQueueReceive(ackQueue, &r, 0) == pdTRUE)
+            onAck(r);
+        while (inflight && ring[tail].d.offset + ring[tail].len <= acked)
         {
-            Slot &slot = win[(tail + count) % WINDOW];
+            tail = (tail + 1) % RING;
+            inflight--;
+        }
+        if (!ok)
+            break;
+        if (resendNow)
+        {
+            resendNow = false;
+            for (uint8_t i = 0; i < inflight; i++)
+            {
+                retries++;
+                transmit(ring[(tail + i) % RING], true);
+            }
+            lastProgress = millis();
+        }
+
+        // send whatever the window, and ESP-NOW's queue, has room for
+        while (inflight < window && ready)
+        {
+            const int sr = transmit(ring[(tail + inflight) % RING], false);
+            if (sr < 0)
+                ok = false;
+            if (sr <= 0)
+                break;
+            inflight++;
+            ready--;
+        }
+        if (!ok)
+            break;
+
+        if (!eof && sent < rawSize && inflight + ready < window + PREFETCH && src->ready())
+        {
+            // read one packet ahead from the (possibly inflated) stream
+            Slot &slot = ring[(tail + inflight + ready) % RING];
             int n = 0;
             while (n < (int)DATA_MAX)
             {
@@ -501,45 +660,22 @@ bool runRxUpdate(SDBulkLink &link, const char *path, bool linked, char *result, 
                 }
                 n += got;
             }
-            if (!ok || n == 0)
+            if (!ok)
                 break;
-            mbedtls_sha256_update_ret(&sha, slot.d.data, n);
-            slot.len = n;
-            slot.d.offset = sent;
-            sent += n;
-            count++;
-            if (!transmit(slot))
-                ok = false;
-        }
-        if (!ok || count == 0)
-            break;
-
-        // collect acks; any progress slides the window
-        const uint32_t before = acked;
-        const uint32_t waitStart = millis();
-        while (acked == before && millis() - waitStart < 60)
-        {
-            if (xQueueReceive(ackQueue, &r, pdMS_TO_TICKS(2)) != pdTRUE)
-                continue;
-            const auto h = (const Header *)r.data;
-            if (h->type != DATA_ACK)
-                continue;
-            const auto a = (const DataAck *)r.data;
-            if (a->status != ST_OK)
+            if (n > 0)
             {
-                ok = false;
-                break;
+                mbedtls_sha256_update_ret(&sha, slot.d.data, n);
+                slot.len = n;
+                slot.d.offset = sent;
+                sent += n;
+                ready++;
             }
-            if (a->next > acked)
-                acked = a->next;
         }
-        while (count && win[tail].d.offset + win[tail].len <= acked)
+        else if (!inflight && !ready && (eof || sent >= rawSize))
         {
-            tail = (tail + 1) % WINDOW;
-            count--;
+            break; // the stream ended short of rawSize; FINISH reports it
         }
-
-        if (acked == before && ok)
+        else if (millis() - lastProgress >= 60)
         {
             // nothing moved: resend everything still in flight, oldest first
             if (++stalls > 100)
@@ -547,30 +683,39 @@ bool runRxUpdate(SDBulkLink &link, const char *path, bool linked, char *result, 
                 ok = false;
                 break;
             }
-            for (uint8_t i = 0; i < count; i++)
+            for (uint8_t i = 0; i < inflight; i++)
             {
                 retries++;
-                transmit(win[(tail + i) % WINDOW]);
+                transmit(ring[(tail + i) % RING], true);
             }
+            lastProgress = millis();
         }
         else
         {
-            stalls = 0;
+            // nothing to read or send until the card answers, an ack comes in or the
+            // air frees up. The card's answer has no callback, so poll for it.
+            if (src->busy())
+                taskYIELD();
+            else
+                ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2));
         }
 
-        lastCall = millis(); // the SD reads above are the handset's keepalive
-        if (acked - lastShown >= 16384 || acked == rawSize || millis() - lastCall > KEEPALIVE_MS)
+        // the card reads are the handset's keepalive; a progress update is a round trip
+        // the UI takes ~9 ms to answer, so the bar moves twice a second and no more
+        if (millis() - lastCall >= PROGRESS_MS || acked == rawSize)
         {
+            src->settle();
             snprintf(text, sizeof(text), "Sending %u/%u KB", acked / 1024, rawSize / 1024);
-            if (keepalive(link, text, acked, rawSize, true) == SDBulk::CANCELLED)
+            const int kst = keepalive(link, text, acked, rawSize, true);
+            if (kst == SDBulk::CANCELLED)
             {
                 ok = false;
                 cancelled = true;
                 break;
             }
-            lastShown = acked;
         }
     }
+    waiter = nullptr;
     src->close();
     const uint32_t dt = millis() - ts;
 
